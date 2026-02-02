@@ -1,9 +1,11 @@
 #version 460
 
 layout(set = 0, binding = 0) uniform sampler2D hdrImage;
+layout(set = 0, binding = 1) uniform sampler2D bloomTexture;
 
 layout(push_constant) uniform TonemapPC {
     uint debugMode;
+    float bloomIntensity;
 };
 
 layout(location = 0) in vec2 fragUV;
@@ -55,8 +57,10 @@ vec3 cas(vec2 uv) {
 void main() {
     vec3 result;
     if (debugMode == 0u) {
-        // Final: sharpen then tone map
+        // Final: sharpen, add bloom, then tone map
         vec3 hdr = cas(fragUV);
+        vec3 bloom = texture(bloomTexture, fragUV).rgb;
+        hdr += bloom * bloomIntensity;
         result = acesTonemap(hdr);
     } else {
         // Debug modes: pass through (already LDR from lighting pass)

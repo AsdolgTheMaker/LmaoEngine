@@ -19,6 +19,7 @@ public:
     PipelineBuilder& setDepthTest(bool enable, bool write = true, VkCompareOp op = VK_COMPARE_OP_GREATER_OR_EQUAL);
     PipelineBuilder& setDepthBias(bool enable, float constantFactor = 0.0f, float slopeFactor = 0.0f);
     PipelineBuilder& setColorBlendAttachment(uint32_t count, bool blendEnable = false);
+    PipelineBuilder& setBlendAdditive();
     PipelineBuilder& setMultisample(VkSampleCountFlagBits samples);
     PipelineBuilder& setDynamicStates(const std::vector<VkDynamicState>& states);
     PipelineBuilder& setLayout(VkPipelineLayout layout);

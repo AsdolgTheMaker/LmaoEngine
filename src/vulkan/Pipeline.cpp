@@ -101,6 +101,22 @@ PipelineBuilder& PipelineBuilder::setColorBlendAttachment(uint32_t count, bool b
     return *this;
 }
 
+PipelineBuilder& PipelineBuilder::setBlendAdditive() {
+    m_blendAttachments.clear();
+    VkPipelineColorBlendAttachmentState blend{};
+    blend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                           VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    blend.blendEnable = VK_TRUE;
+    blend.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+    blend.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
+    blend.colorBlendOp = VK_BLEND_OP_ADD;
+    blend.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    blend.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    blend.alphaBlendOp = VK_BLEND_OP_ADD;
+    m_blendAttachments.push_back(blend);
+    return *this;
+}
+
 PipelineBuilder& PipelineBuilder::setMultisample(VkSampleCountFlagBits samples) {
     m_multisample.rasterizationSamples = samples;
     return *this;

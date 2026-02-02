@@ -22,6 +22,9 @@ layout(set = 0, binding = 0) uniform GlobalUBO {
     mat4 cascadeViewProj[3];
     vec4 cascadeSplits; // xyz = split depths (view-space), w = shadow bias
     float iblIntensity;
+    float ssaoRadius;
+    float ssaoBias;
+    float bloomIntensity;
 };
 
 layout(set = 0, binding = 1) readonly buffer PointLightSSBO {
@@ -35,6 +38,7 @@ layout(set = 0, binding = 5) uniform sampler2DArrayShadow shadowMap;
 layout(set = 0, binding = 6) uniform samplerCube irradianceMap;
 layout(set = 0, binding = 7) uniform samplerCube prefilteredMap;
 layout(set = 0, binding = 8) uniform sampler2D brdfLUT;
+layout(set = 0, binding = 9) uniform sampler2D ssaoTex;
 
 layout(push_constant) uniform LightingPC {
     uint debugMode;
@@ -197,6 +201,7 @@ void main() {
     if (debugMode == 3u) { outColor = vec4(vec3(roughness), 1.0); return; }
     if (debugMode == 4u) { outColor = vec4(N * 0.5 + 0.5, 1.0); return; }
     if (debugMode == 5u) { outColor = vec4(vec3(depth), 1.0); return; }
+    if (debugMode == 6u) { float ao = texture(ssaoTex, fragUV).r; outColor = vec4(vec3(ao), 1.0); return; }
 
     // Reconstruct world position from depth
     vec3 worldPos = reconstructWorldPos(fragUV, depth);
@@ -231,7 +236,9 @@ void main() {
     vec2 brdf = texture(brdfLUT, vec2(NdotV, roughness)).rg;
     vec3 specularIBL = prefilteredColor * (F * brdf.x + brdf.y);
 
-    vec3 color = (diffuseIBL + specularIBL) * iblIntensity;
+    // Modulate ambient by SSAO
+    float ao = texture(ssaoTex, fragUV).r;
+    vec3 color = (diffuseIBL + specularIBL) * iblIntensity * ao;
 
     // Shadow factor for directional light
     float shadow = (depth == 0.0) ? 1.0 : sampleShadowPCF(worldPos, viewZ);

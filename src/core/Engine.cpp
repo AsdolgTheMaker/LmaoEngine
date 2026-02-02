@@ -7,6 +7,9 @@
 #include "assets/Texture.h"
 #include "assets/TextureLoader.h"
 #include "assets/Material.h"
+#include <imgui.h>
+#include <imgui_impl_glfw.h>
+#include <imgui_impl_vulkan.h>
 #include <GLFW/glfw3.h>
 #include <algorithm>
 #include <cmath>
@@ -190,6 +193,18 @@ bool Engine::init() {
         VK_CHECK(vkCreateSampler(m_vkCtx.device(), &sampCI, nullptr, &m_linearSampler));
     }
 
+    // Repeat sampler (nearest, repeat — for noise textures)
+    {
+        VkSamplerCreateInfo sampCI{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        sampCI.magFilter = VK_FILTER_NEAREST;
+        sampCI.minFilter = VK_FILTER_NEAREST;
+        sampCI.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        sampCI.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        sampCI.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        sampCI.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        VK_CHECK(vkCreateSampler(m_vkCtx.device(), &sampCI, nullptr, &m_repeatSampler));
+    }
+
     // Shadow comparison sampler
     {
         VkSamplerCreateInfo sampCI{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
@@ -206,7 +221,7 @@ bool Engine::init() {
     }
 
     // Global UBO + point light SSBO descriptor set layout
-    VkDescriptorSetLayoutBinding globalBindings[9] = {
+    VkDescriptorSetLayoutBinding globalBindings[10] = {
         {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1,
          VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
         {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
@@ -225,8 +240,10 @@ bool Engine::init() {
          VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
         {8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
          VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+        {9, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
+         VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
     };
-    m_globalSetLayout = m_descriptors.getOrCreateLayout(globalBindings, 9);
+    m_globalSetLayout = m_descriptors.getOrCreateLayout(globalBindings, 10);
 
     for (uint32_t i = 0; i < m_swapchain.imageCount(); i++) {
         m_uniformBuffers[i].init(m_vkCtx.allocator(), sizeof(GlobalUBO),
@@ -255,12 +272,18 @@ bool Engine::init() {
     if (!initShadowPass()) return false;
     if (!initGBufferPass()) return false;
     initIBL();
+    if (!initSSAOPass()) return false;
     if (!initLightingPass()) return false;
     if (!initSkyboxPass()) return false;
+    if (!initBloomPass()) return false;
     if (!initMotionPass()) return false;
     if (!initTAAPass()) return false;
     if (!initTonemapPass()) return false;
     if (!initFXAAPass()) return false;
+    if (!initImGui()) return false;
+
+    // Re-write lighting descriptors now that SSAO images exist
+    updateLightingDescriptors();
 
     // Initialize AA descriptor sets
     updateAADescriptors();
@@ -470,6 +493,10 @@ void Engine::updateLightingDescriptors() {
             DescriptorManager::writeImage(m_vkCtx.device(), m_globalSets[i], 8,
                 m_brdfLUT.view(), m_linearSampler);
         }
+        if (m_ssaoBlurred.handle()) {
+            DescriptorManager::writeImage(m_vkCtx.device(), m_globalSets[i], 9,
+                m_ssaoBlurred.view(), m_linearSampler);
+        }
     }
 }
 
@@ -504,6 +531,11 @@ void Engine::updateAADescriptors() {
             // So tonemap reads history[1-i]
             DescriptorManager::writeImage(device, m_tonemapSets[i], 0,
                 m_taaHistory[1 - i].view(), m_linearSampler);
+            // Bloom texture (mip 0 = final bloom result)
+            if (m_bloomMipViews[0]) {
+                DescriptorManager::writeImage(device, m_tonemapSets[i], 1,
+                    m_bloomMipViews[0], m_linearSampler);
+            }
         }
     }
 
@@ -964,6 +996,281 @@ bool Engine::initSkyboxPass() {
     return true;
 }
 
+void Engine::createSSAOImages() {
+    uint32_t w = m_swapchain.extent().width / 2;
+    uint32_t h = m_swapchain.extent().height / 2;
+
+    Image::CreateInfo ci{};
+    ci.width = w;
+    ci.height = h;
+    ci.format = VK_FORMAT_R8_UNORM;
+    ci.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    ci.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+
+    m_ssaoRaw.init(m_vkCtx.allocator(), m_vkCtx.device(), ci);
+    m_ssaoBlurred.init(m_vkCtx.allocator(), m_vkCtx.device(), ci);
+}
+
+void Engine::createBloomImages() {
+    VkDevice device = m_vkCtx.device();
+    uint32_t w = m_swapchain.extent().width / 2;
+    uint32_t h = m_swapchain.extent().height / 2;
+
+    // Destroy old per-mip views
+    for (uint32_t i = 0; i < BLOOM_MIP_COUNT; i++) {
+        if (m_bloomMipViews[i]) {
+            vkDestroyImageView(device, m_bloomMipViews[i], nullptr);
+            m_bloomMipViews[i] = VK_NULL_HANDLE;
+        }
+    }
+
+    Image::CreateInfo ci{};
+    ci.width = w;
+    ci.height = h;
+    ci.mipLevels = BLOOM_MIP_COUNT;
+    ci.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+    ci.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    ci.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+    m_bloomMipChain.init(m_vkCtx.allocator(), device, ci);
+
+    // Per-mip views for rendering targets
+    for (uint32_t i = 0; i < BLOOM_MIP_COUNT; i++) {
+        VkImageViewCreateInfo viewCI{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        viewCI.image = m_bloomMipChain.handle();
+        viewCI.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        viewCI.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+        viewCI.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        viewCI.subresourceRange.baseMipLevel = i;
+        viewCI.subresourceRange.levelCount = 1;
+        viewCI.subresourceRange.baseArrayLayer = 0;
+        viewCI.subresourceRange.layerCount = 1;
+        VK_CHECK(vkCreateImageView(device, &viewCI, nullptr, &m_bloomMipViews[i]));
+    }
+
+    // Transition all mips to shader read for initial validity
+    m_cmdPool.submitImmediate(m_vkCtx.graphicsQueue(), [&](VkCommandBuffer cmd) {
+        Image::transitionLayout(cmd, m_bloomMipChain.handle(),
+            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_IMAGE_ASPECT_COLOR_BIT, BLOOM_MIP_COUNT);
+    });
+}
+
+bool Engine::initSSAOPass() {
+    VkDevice device = m_vkCtx.device();
+
+    createSSAOImages();
+
+    // Generate 64-sample hemisphere kernel
+    {
+        struct { vec4 samples[64]; } kernelData{};
+        // Simple deterministic pseudo-random kernel
+        for (int i = 0; i < 64; i++) {
+            // Use simple hash-based pseudo-random (deterministic)
+            float fi = static_cast<float>(i);
+            float x = std::sin(fi * 12.9898f + 78.233f) * 43758.5453f;
+            float y = std::sin(fi * 63.7264f + 10.873f) * 43758.5453f;
+            float z = std::sin(fi * 37.1694f + 44.289f) * 43758.5453f;
+            x = (x - std::floor(x)) * 2.0f - 1.0f;
+            y = (y - std::floor(y)) * 2.0f - 1.0f;
+            z = (z - std::floor(z)); // hemisphere: z >= 0
+            vec3 s = glm::normalize(vec3(x, y, std::max(z, 0.05f)));
+            float r = std::sin(fi * 93.9898f + 67.345f) * 43758.5453f;
+            r = r - std::floor(r); // [0, 1]
+            s *= r;
+            // Accelerating scale: more samples near origin
+            float scale = static_cast<float>(i) / 64.0f;
+            scale = 0.1f + scale * scale * 0.9f;
+            s *= scale;
+            kernelData.samples[i] = vec4(s, 0.0f);
+        }
+        m_ssaoKernelBuffer.init(m_vkCtx.allocator(), sizeof(kernelData),
+            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+            VMA_MEMORY_USAGE_AUTO,
+            VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT);
+        m_ssaoKernelBuffer.upload(&kernelData, sizeof(kernelData));
+    }
+
+    // Generate 4x4 noise texture (RG16F, random rotation vectors)
+    {
+        struct { float rg[2]; } noisePixels[16];
+        for (int i = 0; i < 16; i++) {
+            float fi = static_cast<float>(i);
+            float angle = std::sin(fi * 42.9898f + 12.345f) * 43758.5453f;
+            angle = (angle - std::floor(angle)) * 6.28318f;
+            noisePixels[i].rg[0] = std::cos(angle);
+            noisePixels[i].rg[1] = std::sin(angle);
+        }
+
+        Buffer staging;
+        staging.init(m_vkCtx.allocator(), sizeof(noisePixels),
+            VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            VMA_MEMORY_USAGE_AUTO,
+            VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
+        staging.upload(noisePixels, sizeof(noisePixels));
+
+        Image::CreateInfo ci{};
+        ci.width = 4;
+        ci.height = 4;
+        ci.format = VK_FORMAT_R32G32_SFLOAT;
+        ci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        m_ssaoNoise.init(m_vkCtx.allocator(), device, ci);
+
+        m_cmdPool.submitImmediate(m_vkCtx.graphicsQueue(), [&](VkCommandBuffer cmd) {
+            Image::transitionLayout(cmd, m_ssaoNoise.handle(),
+                VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            VkBufferImageCopy region{};
+            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            region.imageSubresource.layerCount = 1;
+            region.imageExtent = {4, 4, 1};
+            vkCmdCopyBufferToImage(cmd, staging.handle(), m_ssaoNoise.handle(),
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+            Image::transitionLayout(cmd, m_ssaoNoise.handle(),
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        });
+        staging.shutdown();
+    }
+
+    // SSAO descriptor set layout (set 1): noise texture + kernel UBO
+    VkDescriptorSetLayoutBinding ssaoBindings[2]{};
+    ssaoBindings[0] = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
+                        VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+    ssaoBindings[1] = {1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1,
+                        VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+    m_ssaoSetLayout = m_descriptors.getOrCreateLayout(ssaoBindings, 2);
+    m_ssaoSet = m_descriptors.allocate(m_ssaoSetLayout);
+    DescriptorManager::writeImage(device, m_ssaoSet, 0, m_ssaoNoise.view(), m_repeatSampler);
+    DescriptorManager::writeBuffer(device, m_ssaoSet, 1, m_ssaoKernelBuffer.handle(), sizeof(vec4) * 64);
+
+    // SSAO pipeline: set 0 = global, set 1 = SSAO
+    // Load fullscreen vertex shader if not yet loaded (shared by multiple passes)
+    if (!m_fullscreenVert.handle()) {
+        if (!m_fullscreenVert.loadFromFile(device, "shaders/deferred/fullscreen.vert.spv")) return false;
+    }
+    if (!m_ssaoFrag.loadFromFile(device, "shaders/deferred/ssao.frag.spv")) return false;
+
+    VkDescriptorSetLayout ssaoSetLayouts[] = {m_globalSetLayout, m_ssaoSetLayout};
+    VkPipelineLayoutCreateInfo layoutCI{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    layoutCI.setLayoutCount = 2;
+    layoutCI.pSetLayouts = ssaoSetLayouts;
+    VK_CHECK(vkCreatePipelineLayout(device, &layoutCI, nullptr, &m_ssaoPipelineLayout));
+
+    m_ssaoPipeline = PipelineBuilder()
+        .addShaderStage(m_fullscreenVert.stageInfo(VK_SHADER_STAGE_VERTEX_BIT))
+        .addShaderStage(m_ssaoFrag.stageInfo(VK_SHADER_STAGE_FRAGMENT_BIT))
+        .setColorFormats({VK_FORMAT_R8_UNORM})
+        .setDepthTest(false, false)
+        .setCullMode(VK_CULL_MODE_NONE)
+        .setLayout(m_ssaoPipelineLayout)
+        .build(device);
+
+    // SSAO blur descriptor set layout: raw SSAO + depth
+    VkDescriptorSetLayoutBinding blurBindings[2]{};
+    blurBindings[0] = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
+                        VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+    blurBindings[1] = {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
+                        VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+    m_ssaoBlurSetLayout = m_descriptors.getOrCreateLayout(blurBindings, 2);
+    m_ssaoBlurSet = m_descriptors.allocate(m_ssaoBlurSetLayout);
+    DescriptorManager::writeImage(device, m_ssaoBlurSet, 0, m_ssaoRaw.view(), m_nearestSampler);
+    DescriptorManager::writeImage(device, m_ssaoBlurSet, 1, m_depthImage.view(), m_nearestSampler);
+
+    if (!m_ssaoBlurFrag.loadFromFile(device, "shaders/deferred/ssao_blur.frag.spv")) return false;
+
+    VkPipelineLayoutCreateInfo blurLayoutCI{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    blurLayoutCI.setLayoutCount = 1;
+    blurLayoutCI.pSetLayouts = &m_ssaoBlurSetLayout;
+    VK_CHECK(vkCreatePipelineLayout(device, &blurLayoutCI, nullptr, &m_ssaoBlurPipelineLayout));
+
+    m_ssaoBlurPipeline = PipelineBuilder()
+        .addShaderStage(m_fullscreenVert.stageInfo(VK_SHADER_STAGE_VERTEX_BIT))
+        .addShaderStage(m_ssaoBlurFrag.stageInfo(VK_SHADER_STAGE_FRAGMENT_BIT))
+        .setColorFormats({VK_FORMAT_R8_UNORM})
+        .setDepthTest(false, false)
+        .setCullMode(VK_CULL_MODE_NONE)
+        .setLayout(m_ssaoBlurPipelineLayout)
+        .build(device);
+
+    LOG(Pipeline, Info, "SSAO pipeline created");
+    return true;
+}
+
+bool Engine::initBloomPass() {
+    VkDevice device = m_vkCtx.device();
+
+    createBloomImages();
+
+    // Bloom descriptor set layout: single sampler2D source
+    VkDescriptorSetLayoutBinding bloomBinding{};
+    bloomBinding.binding = 0;
+    bloomBinding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    bloomBinding.descriptorCount = 1;
+    bloomBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    m_bloomSetLayout = m_descriptors.getOrCreateLayout(&bloomBinding, 1);
+
+    // Downsample pipeline
+    if (!m_bloomDownFrag.loadFromFile(device, "shaders/deferred/bloom_downsample.frag.spv")) return false;
+
+    VkPushConstantRange pushRange{};
+    pushRange.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    pushRange.size = sizeof(float) * 2 + sizeof(int); // srcTexelSize + firstMip
+
+    VkPipelineLayoutCreateInfo layoutCI{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    layoutCI.setLayoutCount = 1;
+    layoutCI.pSetLayouts = &m_bloomSetLayout;
+    layoutCI.pushConstantRangeCount = 1;
+    layoutCI.pPushConstantRanges = &pushRange;
+    VK_CHECK(vkCreatePipelineLayout(device, &layoutCI, nullptr, &m_bloomDownPipelineLayout));
+
+    m_bloomDownPipeline = PipelineBuilder()
+        .addShaderStage(m_fullscreenVert.stageInfo(VK_SHADER_STAGE_VERTEX_BIT))
+        .addShaderStage(m_bloomDownFrag.stageInfo(VK_SHADER_STAGE_FRAGMENT_BIT))
+        .setColorFormats({VK_FORMAT_R16G16B16A16_SFLOAT})
+        .setDepthTest(false, false)
+        .setCullMode(VK_CULL_MODE_NONE)
+        .setLayout(m_bloomDownPipelineLayout)
+        .build(device);
+
+    // Upsample pipeline (additive blend)
+    if (!m_bloomUpFrag.loadFromFile(device, "shaders/deferred/bloom_upsample.frag.spv")) return false;
+
+    VK_CHECK(vkCreatePipelineLayout(device, &layoutCI, nullptr, &m_bloomUpPipelineLayout));
+
+    m_bloomUpPipeline = PipelineBuilder()
+        .addShaderStage(m_fullscreenVert.stageInfo(VK_SHADER_STAGE_VERTEX_BIT))
+        .addShaderStage(m_bloomUpFrag.stageInfo(VK_SHADER_STAGE_FRAGMENT_BIT))
+        .setColorFormats({VK_FORMAT_R16G16B16A16_SFLOAT})
+        .setDepthTest(false, false)
+        .setCullMode(VK_CULL_MODE_NONE)
+        .setBlendAdditive()
+        .setLayout(m_bloomUpPipelineLayout)
+        .build(device);
+
+    // Allocate descriptor sets for downsample sources
+    // Down step 0 reads HDR, steps 1-5 read bloom mip 0-4
+    for (uint32_t i = 0; i < BLOOM_MIP_COUNT; i++) {
+        m_bloomDownSets[i] = m_descriptors.allocate(m_bloomSetLayout);
+        if (i == 0) {
+            DescriptorManager::writeImage(device, m_bloomDownSets[i], 0,
+                m_hdrImage.view(), m_linearSampler);
+        } else {
+            DescriptorManager::writeImage(device, m_bloomDownSets[i], 0,
+                m_bloomMipViews[i - 1], m_linearSampler);
+        }
+    }
+
+    // Allocate descriptor sets for upsample sources
+    // Up step i reads bloom mip (BLOOM_MIP_COUNT-1-i), writes to mip (BLOOM_MIP_COUNT-2-i)
+    for (uint32_t i = 0; i < BLOOM_MIP_COUNT - 1; i++) {
+        m_bloomUpSets[i] = m_descriptors.allocate(m_bloomSetLayout);
+        uint32_t srcMip = BLOOM_MIP_COUNT - 1 - i;
+        DescriptorManager::writeImage(device, m_bloomUpSets[i], 0,
+            m_bloomMipViews[srcMip], m_linearSampler);
+    }
+
+    LOG(Pipeline, Info, "Bloom pipeline created");
+    return true;
+}
+
 bool Engine::initLightingPass() {
     VkDevice device = m_vkCtx.device();
 
@@ -1066,18 +1373,22 @@ bool Engine::initTonemapPass() {
 
     if (!m_tonemapFrag.loadFromFile(device, "shaders/deferred/tonemap.frag.spv")) return false;
 
-    // Tonemap descriptor set layout: binding 0 = HDR/TAA sampler
-    VkDescriptorSetLayoutBinding tonemapBinding{};
-    tonemapBinding.binding = 0;
-    tonemapBinding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    tonemapBinding.descriptorCount = 1;
-    tonemapBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-    m_tonemapSetLayout = m_descriptors.getOrCreateLayout(&tonemapBinding, 1);
+    // Tonemap descriptor set layout: binding 0 = HDR/TAA sampler, binding 1 = bloom
+    VkDescriptorSetLayoutBinding tonemapBindings[2]{};
+    tonemapBindings[0].binding = 0;
+    tonemapBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    tonemapBindings[0].descriptorCount = 1;
+    tonemapBindings[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    tonemapBindings[1].binding = 1;
+    tonemapBindings[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    tonemapBindings[1].descriptorCount = 1;
+    tonemapBindings[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    m_tonemapSetLayout = m_descriptors.getOrCreateLayout(tonemapBindings, 2);
 
     VkPushConstantRange pushRange{};
     pushRange.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     pushRange.offset = 0;
-    pushRange.size = sizeof(uint32_t);
+    pushRange.size = sizeof(uint32_t) + sizeof(float); // debugMode + bloomIntensity
 
     VkPipelineLayoutCreateInfo layoutCI{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     layoutCI.setLayoutCount = 1;
@@ -1136,6 +1447,115 @@ bool Engine::initFXAAPass() {
 
     LOG(Pipeline, Info, "FXAA pipeline created");
     return true;
+}
+
+bool Engine::initImGui() {
+    VkDevice device = m_vkCtx.device();
+
+    // Create a dedicated descriptor pool for ImGui
+    VkDescriptorPoolSize poolSizes[] = {
+        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 16},
+    };
+    VkDescriptorPoolCreateInfo poolCI{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    poolCI.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+    poolCI.maxSets = 16;
+    poolCI.poolSizeCount = 1;
+    poolCI.pPoolSizes = poolSizes;
+    VK_CHECK(vkCreateDescriptorPool(device, &poolCI, nullptr, &m_imguiPool));
+
+    // Init ImGui context
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    ImGui::StyleColorsDark();
+    ImGuiStyle& style = ImGui::GetStyle();
+    style.WindowRounding = 4.0f;
+    style.FrameRounding = 2.0f;
+    style.Alpha = 0.92f;
+
+    // Load Vulkan function pointers for ImGui (needed with VK_NO_PROTOTYPES / volk)
+    ImGui_ImplVulkan_LoadFunctions([](const char* name, void* userData) {
+        return vkGetInstanceProcAddr(static_cast<VkInstance>(userData), name);
+    }, static_cast<void*>(m_vkCtx.instance()));
+
+    // Init GLFW backend (install_callbacks=true chains with existing Input callbacks)
+    ImGui_ImplGlfw_InitForVulkan(m_window.handle(), true);
+
+    // Init Vulkan backend with dynamic rendering
+    ImGui_ImplVulkan_InitInfo initInfo{};
+    initInfo.Instance = m_vkCtx.instance();
+    initInfo.PhysicalDevice = m_vkCtx.physicalDevice();
+    initInfo.Device = device;
+    initInfo.QueueFamily = m_vkCtx.queueFamilies().graphics;
+    initInfo.Queue = m_vkCtx.graphicsQueue();
+    initInfo.DescriptorPool = m_imguiPool;
+    initInfo.MinImageCount = 2;
+    initInfo.ImageCount = m_swapchain.imageCount();
+    initInfo.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
+    initInfo.UseDynamicRendering = true;
+    initInfo.PipelineRenderingCreateInfo = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+    initInfo.PipelineRenderingCreateInfo.colorAttachmentCount = 1;
+    VkFormat swapFormat = m_swapchain.imageFormat();
+    initInfo.PipelineRenderingCreateInfo.pColorAttachmentFormats = &swapFormat;
+
+    ImGui_ImplVulkan_Init(&initInfo);
+
+    m_imguiInitialized = true;
+    LOG(Gui, Info, "ImGui initialized (dynamic rendering)");
+    return true;
+}
+
+void Engine::buildImGui() {
+    ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(280, 0), ImGuiCond_FirstUseEver);
+
+    if (ImGui::Begin("Render Settings")) {
+        ImGui::Text("FPS: %.1f", ImGui::GetIO().Framerate);
+        ImGui::Separator();
+
+        if (ImGui::CollapsingHeader("SSAO", ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::Checkbox("Enable SSAO", &m_ssaoEnabled);
+            ImGui::SliderFloat("Radius", &m_ssaoRadiusUI, 0.1f, 2.0f, "%.2f");
+            ImGui::SliderFloat("Bias", &m_ssaoBiasUI, 0.001f, 0.1f, "%.3f");
+        }
+
+        if (ImGui::CollapsingHeader("Bloom", ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::Checkbox("Enable Bloom", &m_bloomEnabled);
+            ImGui::SliderFloat("Intensity##bloom", &m_bloomIntensityUI, 0.0f, 0.2f, "%.3f");
+        }
+
+        if (ImGui::CollapsingHeader("IBL", ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::SliderFloat("Intensity##ibl", &m_iblIntensityUI, 0.0f, 3.0f, "%.2f");
+        }
+
+        if (ImGui::CollapsingHeader("Debug View")) {
+            int mode = static_cast<int>(m_debugMode);
+            const char* modes[] = {"Final", "Albedo", "Metallic", "Roughness", "Normals", "Depth", "SSAO", "Cascades"};
+            if (ImGui::Combo("Mode", &mode, modes, 8)) {
+                m_debugMode = static_cast<DebugMode>(mode);
+            }
+        }
+    }
+    ImGui::End();
+}
+
+void Engine::recordImGuiPass(VkCommandBuffer cmd, uint32_t imageIndex) {
+    VkRenderingAttachmentInfo colorAttach{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    colorAttach.imageView = m_swapchain.imageView(imageIndex);
+    colorAttach.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    colorAttach.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    colorAttach.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+
+    VkRenderingInfo renderInfo{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    renderInfo.renderArea = {{0, 0}, m_swapchain.extent()};
+    renderInfo.layerCount = 1;
+    renderInfo.colorAttachmentCount = 1;
+    renderInfo.pColorAttachments = &colorAttach;
+
+    vkCmdBeginRendering(cmd, &renderInfo);
+    ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cmd);
+    vkCmdEndRendering(cmd);
 }
 
 void Engine::setupDemoScene() {
@@ -1272,6 +1692,62 @@ void Engine::setupDemoScene() {
     cone.transform.position = {1.5f, 0.75f, -3.0f};
     cone.mesh = coneMesh;
     cone.material = silverMat;
+
+    // === Objects with corners/crevices for SSAO visibility ===
+
+    // Stacked wall of boxes (back-left corner)
+    auto wallMat = makeMat(whiteTex, flatNormalTex, defaultMRTex,
+        vec4(0.7f, 0.7f, 0.72f, 1), 0.0f, 0.9f);
+    for (int row = 0; row < 3; row++) {
+        for (int col = 0; col < 3; col++) {
+            float xOff = (row % 2 == 0) ? 0.0f : 0.5f; // offset alternate rows
+            auto name = "WallBlock_" + std::to_string(row) + "_" + std::to_string(col);
+            auto& block = m_scene.createEntity(name);
+            block.transform.position = {-7.0f + col * 1.02f + xOff,
+                                         0.5f + row * 1.02f,
+                                         -6.0f};
+            block.mesh = cubeMesh;
+            block.material = wallMat;
+        }
+    }
+
+    // Steps / staircase (right side)
+    for (int i = 0; i < 4; i++) {
+        auto name = "Step_" + std::to_string(i);
+        auto& step = m_scene.createEntity(name);
+        step.transform.position = {6.0f, 0.25f + i * 0.5f, -2.0f + i * 1.0f};
+        step.transform.scale = {2.0f, 0.5f, 1.0f};
+        step.mesh = cubeMesh;
+        step.material = groundMat;
+    }
+
+    // Box sitting on ground (SSAO at base contact)
+    auto& groundBox = m_scene.createEntity("GroundBox");
+    groundBox.transform.position = {-5.0f, 0.4f, 3.0f};
+    groundBox.transform.scale = {0.8f, 0.8f, 0.8f};
+    groundBox.mesh = cubeMesh;
+    groundBox.material = redMat;
+
+    // Small box on top of big box (contact shadow between)
+    auto& topBox = m_scene.createEntity("TopBox");
+    topBox.transform.position = {-5.0f, 1.2f, 3.0f};
+    topBox.transform.scale = {0.4f, 0.4f, 0.4f};
+    topBox.mesh = cubeMesh;
+    topBox.material = blueMat;
+
+    // Sphere nestled in a corner (against the wall blocks)
+    auto& cornerSphere = m_scene.createEntity("CornerSphere");
+    cornerSphere.transform.position = {-5.5f, 0.5f, -5.5f};
+    cornerSphere.transform.scale = vec3(0.5f);
+    cornerSphere.mesh = sphereMesh;
+    cornerSphere.material = goldMat;
+
+    // Cylinder lying on ground (contact line)
+    auto& lyingCyl = m_scene.createEntity("LyingCylinder");
+    lyingCyl.transform.position = {4.0f, 0.5f, 4.0f};
+    lyingCyl.transform.rotation = glm::angleAxis(HALF_PI, vec3(0, 0, 1));
+    lyingCyl.mesh = cylinderMesh;
+    lyingCyl.material = greenMat;
 
     LOG(Scene, Info, "Demo scene: %zu entities, %zu meshes, %zu materials, %zu point lights",
         m_scene.entities().size(), m_meshes.size(), m_materials.size(),
@@ -1429,6 +1905,86 @@ void Engine::recordGBufferPass(VkCommandBuffer cmd) {
         VK_IMAGE_ASPECT_DEPTH_BIT);
 }
 
+void Engine::recordSSAOPass(VkCommandBuffer cmd) {
+    // SSAO raw pass at half resolution
+    Image::transitionLayout(cmd, m_ssaoRaw.handle(),
+        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+
+    VkRenderingAttachmentInfo colorAttach{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    colorAttach.imageView = m_ssaoRaw.view();
+    colorAttach.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    colorAttach.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    colorAttach.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    colorAttach.clearValue.color = {{1.0f, 1.0f, 1.0f, 1.0f}};
+
+    uint32_t halfW = m_swapchain.extent().width / 2;
+    uint32_t halfH = m_swapchain.extent().height / 2;
+
+    VkRenderingInfo renderInfo{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    renderInfo.renderArea = {{0, 0}, {halfW, halfH}};
+    renderInfo.layerCount = 1;
+    renderInfo.colorAttachmentCount = 1;
+    renderInfo.pColorAttachments = &colorAttach;
+
+    vkCmdBeginRendering(cmd, &renderInfo);
+
+    VkViewport viewport{0, 0, static_cast<float>(halfW), static_cast<float>(halfH), 0.0f, 1.0f};
+    vkCmdSetViewport(cmd, 0, 1, &viewport);
+    VkRect2D scissor{{0, 0}, {halfW, halfH}};
+    vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_ssaoPipeline);
+    uint32_t frame = m_frameSync.currentFrame();
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+        m_ssaoPipelineLayout, 0, 1, &m_globalSets[frame], 0, nullptr);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+        m_ssaoPipelineLayout, 1, 1, &m_ssaoSet, 0, nullptr);
+    vkCmdDraw(cmd, 3, 1, 0, 0);
+
+    vkCmdEndRendering(cmd);
+
+    Image::transitionLayout(cmd, m_ssaoRaw.handle(),
+        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+}
+
+void Engine::recordSSAOBlurPass(VkCommandBuffer cmd) {
+    Image::transitionLayout(cmd, m_ssaoBlurred.handle(),
+        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+
+    VkRenderingAttachmentInfo colorAttach{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    colorAttach.imageView = m_ssaoBlurred.view();
+    colorAttach.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    colorAttach.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    colorAttach.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    colorAttach.clearValue.color = {{1.0f, 1.0f, 1.0f, 1.0f}};
+
+    uint32_t halfW = m_swapchain.extent().width / 2;
+    uint32_t halfH = m_swapchain.extent().height / 2;
+
+    VkRenderingInfo renderInfo{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    renderInfo.renderArea = {{0, 0}, {halfW, halfH}};
+    renderInfo.layerCount = 1;
+    renderInfo.colorAttachmentCount = 1;
+    renderInfo.pColorAttachments = &colorAttach;
+
+    vkCmdBeginRendering(cmd, &renderInfo);
+
+    VkViewport viewport{0, 0, static_cast<float>(halfW), static_cast<float>(halfH), 0.0f, 1.0f};
+    vkCmdSetViewport(cmd, 0, 1, &viewport);
+    VkRect2D scissor{{0, 0}, {halfW, halfH}};
+    vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_ssaoBlurPipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+        m_ssaoBlurPipelineLayout, 0, 1, &m_ssaoBlurSet, 0, nullptr);
+    vkCmdDraw(cmd, 3, 1, 0, 0);
+
+    vkCmdEndRendering(cmd);
+
+    Image::transitionLayout(cmd, m_ssaoBlurred.handle(),
+        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+}
+
 void Engine::recordLightingPass(VkCommandBuffer cmd) {
     Image::transitionLayout(cmd, m_hdrImage.handle(),
         VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
@@ -1517,9 +2073,161 @@ void Engine::recordSkyboxPass(VkCommandBuffer cmd) {
 
     vkCmdEndRendering(cmd);
 
-    // Transition HDR to shader read for TAA
+    // Transition HDR to shader read for bloom and TAA
     Image::transitionLayout(cmd, m_hdrImage.handle(),
         VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+}
+
+void Engine::recordBloomPass(VkCommandBuffer cmd) {
+    uint32_t baseW = m_swapchain.extent().width / 2;
+    uint32_t baseH = m_swapchain.extent().height / 2;
+
+    // Downsample chain: mip 0..BLOOM_MIP_COUNT-1
+    for (uint32_t mip = 0; mip < BLOOM_MIP_COUNT; mip++) {
+        uint32_t mipW = std::max(baseW >> mip, 1u);
+        uint32_t mipH = std::max(baseH >> mip, 1u);
+
+        // Transition target mip to color attachment
+        {
+            VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+            barrier.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            barrier.image = m_bloomMipChain.handle();
+            barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            barrier.subresourceRange.baseMipLevel = mip;
+            barrier.subresourceRange.levelCount = 1;
+            barrier.subresourceRange.layerCount = 1;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+        }
+
+        VkRenderingAttachmentInfo colorAttach{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+        colorAttach.imageView = m_bloomMipViews[mip];
+        colorAttach.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        colorAttach.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        colorAttach.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        colorAttach.clearValue.color = {{0.0f, 0.0f, 0.0f, 0.0f}};
+
+        VkRenderingInfo renderInfo{VK_STRUCTURE_TYPE_RENDERING_INFO};
+        renderInfo.renderArea = {{0, 0}, {mipW, mipH}};
+        renderInfo.layerCount = 1;
+        renderInfo.colorAttachmentCount = 1;
+        renderInfo.pColorAttachments = &colorAttach;
+
+        vkCmdBeginRendering(cmd, &renderInfo);
+
+        VkViewport viewport{0, 0, static_cast<float>(mipW), static_cast<float>(mipH), 0.0f, 1.0f};
+        vkCmdSetViewport(cmd, 0, 1, &viewport);
+        VkRect2D scissor{{0, 0}, {mipW, mipH}};
+        vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_bloomDownPipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+            m_bloomDownPipelineLayout, 0, 1, &m_bloomDownSets[mip], 0, nullptr);
+
+        // Push constants: source texel size and whether this is the first mip
+        uint32_t srcW = (mip == 0) ? m_swapchain.extent().width : (baseW >> (mip - 1));
+        uint32_t srcH = (mip == 0) ? m_swapchain.extent().height : (baseH >> (mip - 1));
+        struct { float texelSize[2]; int firstMip; } pc = {
+            {1.0f / static_cast<float>(srcW), 1.0f / static_cast<float>(srcH)},
+            (mip == 0) ? 1 : 0
+        };
+        vkCmdPushConstants(cmd, m_bloomDownPipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
+        vkCmdDraw(cmd, 3, 1, 0, 0);
+
+        vkCmdEndRendering(cmd);
+
+        // Transition target mip back to shader read
+        {
+            VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+            barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            barrier.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            barrier.image = m_bloomMipChain.handle();
+            barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            barrier.subresourceRange.baseMipLevel = mip;
+            barrier.subresourceRange.levelCount = 1;
+            barrier.subresourceRange.layerCount = 1;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+        }
+    }
+
+    // Upsample chain: mip BLOOM_MIP_COUNT-2 down to 0 (additive blend)
+    for (uint32_t i = 0; i < BLOOM_MIP_COUNT - 1; i++) {
+        uint32_t dstMip = BLOOM_MIP_COUNT - 2 - i;
+        uint32_t srcMip = BLOOM_MIP_COUNT - 1 - i;
+        uint32_t mipW = std::max(baseW >> dstMip, 1u);
+        uint32_t mipH = std::max(baseH >> dstMip, 1u);
+
+        // Transition target mip to color attachment
+        {
+            VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
+            barrier.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            barrier.image = m_bloomMipChain.handle();
+            barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            barrier.subresourceRange.baseMipLevel = dstMip;
+            barrier.subresourceRange.levelCount = 1;
+            barrier.subresourceRange.layerCount = 1;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+        }
+
+        VkRenderingAttachmentInfo colorAttach{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+        colorAttach.imageView = m_bloomMipViews[dstMip];
+        colorAttach.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        colorAttach.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD; // keep downsample content for additive
+        colorAttach.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+
+        VkRenderingInfo renderInfo{VK_STRUCTURE_TYPE_RENDERING_INFO};
+        renderInfo.renderArea = {{0, 0}, {mipW, mipH}};
+        renderInfo.layerCount = 1;
+        renderInfo.colorAttachmentCount = 1;
+        renderInfo.pColorAttachments = &colorAttach;
+
+        vkCmdBeginRendering(cmd, &renderInfo);
+
+        VkViewport viewport{0, 0, static_cast<float>(mipW), static_cast<float>(mipH), 0.0f, 1.0f};
+        vkCmdSetViewport(cmd, 0, 1, &viewport);
+        VkRect2D scissor{{0, 0}, {mipW, mipH}};
+        vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_bloomUpPipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+            m_bloomUpPipelineLayout, 0, 1, &m_bloomUpSets[i], 0, nullptr);
+
+        uint32_t srcW = std::max(baseW >> srcMip, 1u);
+        uint32_t srcH = std::max(baseH >> srcMip, 1u);
+        struct { float texelSize[2]; int unused; } pc = {
+            {1.0f / static_cast<float>(srcW), 1.0f / static_cast<float>(srcH)}, 0
+        };
+        vkCmdPushConstants(cmd, m_bloomUpPipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
+        vkCmdDraw(cmd, 3, 1, 0, 0);
+
+        vkCmdEndRendering(cmd);
+
+        // Transition target mip back to shader read
+        {
+            VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+            barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            barrier.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            barrier.image = m_bloomMipChain.handle();
+            barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            barrier.subresourceRange.baseMipLevel = dstMip;
+            barrier.subresourceRange.levelCount = 1;
+            barrier.subresourceRange.layerCount = 1;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+        }
+    }
 }
 
 void Engine::recordMotionPass(VkCommandBuffer cmd) {
@@ -1659,9 +2367,11 @@ void Engine::recordTonemapPass(VkCommandBuffer cmd) {
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
         m_tonemapPipelineLayout, 0, 1, &m_tonemapSets[m_taaCurrentIdx], 0, nullptr);
 
-    uint32_t debugMode = static_cast<uint32_t>(m_debugMode);
+    struct { uint32_t debugMode; float bloomIntensity; } tonemapPC = {
+        static_cast<uint32_t>(m_debugMode), m_bloomEnabled ? m_bloomIntensityUI : 0.0f
+    };
     vkCmdPushConstants(cmd, m_tonemapPipelineLayout,
-        VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(uint32_t), &debugMode);
+        VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(tonemapPC), &tonemapPC);
 
     vkCmdDraw(cmd, 3, 1, 0, 0);
 
@@ -1718,8 +2428,7 @@ void Engine::recordFXAAPass(VkCommandBuffer cmd, uint32_t imageIndex) {
 
     vkCmdEndRendering(cmd);
 
-    Image::transitionLayout(cmd, m_swapchain.image(imageIndex),
-        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    // Swapchain stays in COLOR_ATTACHMENT_OPTIMAL for ImGui pass
 }
 
 void Engine::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex) {
@@ -1728,12 +2437,23 @@ void Engine::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex) {
 
     recordShadowPass(cmd);     // Depth-only per cascade
     recordGBufferPass(cmd);    // G-buffer pass
-    recordLightingPass(cmd);   // Read G-buffer + shadow map, output HDR
+    recordSSAOPass(cmd);       // Half-res SSAO sampling
+    recordSSAOBlurPass(cmd);   // Bilateral blur SSAO
+    recordLightingPass(cmd);   // Read G-buffer + shadow map + SSAO, output HDR
     recordSkyboxPass(cmd);     // Render sky into HDR for far-plane pixels
+    recordBloomPass(cmd);      // Progressive downsample + upsample bloom
     recordMotionPass(cmd);     // Read depth, output velocity
     recordTAAPass(cmd);        // Read HDR + velocity + history, output to history
-    recordTonemapPass(cmd);    // Read TAA output, output LDR
+    recordTonemapPass(cmd);    // Read TAA output + bloom, output LDR
     recordFXAAPass(cmd, imageIndex); // Read LDR, output to swapchain
+
+    if (m_imguiInitialized) {
+        recordImGuiPass(cmd, imageIndex); // ImGui overlay on swapchain
+    }
+
+    // Final transition to present
+    Image::transitionLayout(cmd, m_swapchain.image(imageIndex),
+        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
 
     VK_CHECK(vkEndCommandBuffer(cmd));
 }
@@ -1750,8 +2470,10 @@ void Engine::drawFrame() {
 
     m_frameSync.resetFence(device);
 
-    // Update camera
-    m_scene.camera().update(m_timer.dt());
+    // Update camera (skip when ImGui captures input)
+    if (!m_imguiInitialized || !ImGui::GetIO().WantCaptureMouse) {
+        m_scene.camera().update(m_timer.dt());
+    }
 
     // Compute TAA jitter (Halton 2,3 sequence)
     float w = static_cast<float>(m_swapchain.extent().width);
@@ -1794,7 +2516,10 @@ void Engine::drawFrame() {
         ubo.cascadeViewProj[i] = m_cascadeVP[i];
     }
     ubo.cascadeSplits = cascadeSplits;
-    ubo.iblIntensity = 1.0f;
+    ubo.iblIntensity = m_iblIntensityUI;
+    ubo.ssaoRadius = m_ssaoEnabled ? m_ssaoRadiusUI : 0.0f;
+    ubo.ssaoBias = m_ssaoBiasUI;
+    ubo.bloomIntensity = m_bloomEnabled ? m_bloomIntensityUI : 0.0f;
 
     m_uniformBuffers[frame].upload(&ubo, sizeof(ubo));
 
@@ -1811,6 +2536,15 @@ void Engine::drawFrame() {
         }
         m_pointLightBuffers[frame].upload(gpuLights.data(),
             sizeof(GPUPointLight) * gpuLights.size());
+    }
+
+    // ImGui frame
+    if (m_imguiInitialized) {
+        ImGui_ImplVulkan_NewFrame();
+        ImGui_ImplGlfw_NewFrame();
+        ImGui::NewFrame();
+        buildImGui();
+        ImGui::Render();
     }
 
     VkCommandBuffer cmd = m_cmdBuffers[frame];
@@ -1858,6 +2592,15 @@ void Engine::handleResize() {
     m_taaHistory[0].shutdown();
     m_taaHistory[1].shutdown();
     m_ldrImage.shutdown();
+    m_ssaoRaw.shutdown();
+    m_ssaoBlurred.shutdown();
+    for (uint32_t i = 0; i < BLOOM_MIP_COUNT; i++) {
+        if (m_bloomMipViews[i]) {
+            vkDestroyImageView(m_vkCtx.device(), m_bloomMipViews[i], nullptr);
+            m_bloomMipViews[i] = VK_NULL_HANDLE;
+        }
+    }
+    m_bloomMipChain.shutdown();
 
     m_frameSync.shutdown();
     m_swapchain.recreate(m_vkCtx, m_window.width(), m_window.height());
@@ -1872,12 +2615,34 @@ void Engine::handleResize() {
     m_depthImage.init(m_vkCtx.allocator(), m_vkCtx.device(), depthCI);
 
     createGBufferImages();
+    createSSAOImages();
     createHDRImage();
+    createBloomImages();
     createVelocityImage();
     createTAAImages();
     createLDRImage();
     updateLightingDescriptors();
     updateAADescriptors();
+
+    // Update SSAO blur descriptor (raw SSAO + depth changed)
+    DescriptorManager::writeImage(m_vkCtx.device(), m_ssaoBlurSet, 0, m_ssaoRaw.view(), m_nearestSampler);
+    DescriptorManager::writeImage(m_vkCtx.device(), m_ssaoBlurSet, 1, m_depthImage.view(), m_nearestSampler);
+
+    // Update bloom descriptor sets (HDR + per-mip views changed)
+    for (uint32_t i = 0; i < BLOOM_MIP_COUNT; i++) {
+        if (i == 0) {
+            DescriptorManager::writeImage(m_vkCtx.device(), m_bloomDownSets[i], 0,
+                m_hdrImage.view(), m_linearSampler);
+        } else {
+            DescriptorManager::writeImage(m_vkCtx.device(), m_bloomDownSets[i], 0,
+                m_bloomMipViews[i - 1], m_linearSampler);
+        }
+    }
+    for (uint32_t i = 0; i < BLOOM_MIP_COUNT - 1; i++) {
+        uint32_t srcMip = BLOOM_MIP_COUNT - 1 - i;
+        DescriptorManager::writeImage(m_vkCtx.device(), m_bloomUpSets[i], 0,
+            m_bloomMipViews[srcMip], m_linearSampler);
+    }
 
     // Reset TAA state on resize
     m_taaCurrentIdx = 0;
@@ -1929,7 +2694,24 @@ void Engine::shutdown() {
     m_textures.clear();
     m_meshes.clear();
 
+    // Destroy ImGui
+    if (m_imguiInitialized) {
+        ImGui_ImplVulkan_Shutdown();
+        ImGui_ImplGlfw_Shutdown();
+        ImGui::DestroyContext();
+        m_imguiInitialized = false;
+    }
+    if (m_imguiPool) { vkDestroyDescriptorPool(device, m_imguiPool, nullptr); m_imguiPool = VK_NULL_HANDLE; }
+
     // Destroy pipelines
+    if (m_ssaoPipeline) vkDestroyPipeline(device, m_ssaoPipeline, nullptr);
+    if (m_ssaoPipelineLayout) vkDestroyPipelineLayout(device, m_ssaoPipelineLayout, nullptr);
+    if (m_ssaoBlurPipeline) vkDestroyPipeline(device, m_ssaoBlurPipeline, nullptr);
+    if (m_ssaoBlurPipelineLayout) vkDestroyPipelineLayout(device, m_ssaoBlurPipelineLayout, nullptr);
+    if (m_bloomDownPipeline) vkDestroyPipeline(device, m_bloomDownPipeline, nullptr);
+    if (m_bloomDownPipelineLayout) vkDestroyPipelineLayout(device, m_bloomDownPipelineLayout, nullptr);
+    if (m_bloomUpPipeline) vkDestroyPipeline(device, m_bloomUpPipeline, nullptr);
+    if (m_bloomUpPipelineLayout) vkDestroyPipelineLayout(device, m_bloomUpPipelineLayout, nullptr);
     if (m_skyboxPipeline) vkDestroyPipeline(device, m_skyboxPipeline, nullptr);
     if (m_skyboxPipelineLayout) vkDestroyPipelineLayout(device, m_skyboxPipelineLayout, nullptr);
     if (m_shadowPipeline) vkDestroyPipeline(device, m_shadowPipeline, nullptr);
@@ -1947,6 +2729,10 @@ void Engine::shutdown() {
     if (m_fxaaPipeline) vkDestroyPipeline(device, m_fxaaPipeline, nullptr);
     if (m_fxaaPipelineLayout) vkDestroyPipelineLayout(device, m_fxaaPipelineLayout, nullptr);
 
+    m_ssaoFrag.shutdown();
+    m_ssaoBlurFrag.shutdown();
+    m_bloomDownFrag.shutdown();
+    m_bloomUpFrag.shutdown();
     m_skyboxVert.shutdown();
     m_skyboxFrag.shutdown();
     m_shadowVert.shutdown();
@@ -1961,6 +2747,7 @@ void Engine::shutdown() {
 
     if (m_nearestSampler) vkDestroySampler(device, m_nearestSampler, nullptr);
     if (m_linearSampler) vkDestroySampler(device, m_linearSampler, nullptr);
+    if (m_repeatSampler) vkDestroySampler(device, m_repeatSampler, nullptr);
     if (m_shadowSampler) vkDestroySampler(device, m_shadowSampler, nullptr);
     if (m_cubemapSampler) vkDestroySampler(device, m_cubemapSampler, nullptr);
 
@@ -1974,6 +2761,19 @@ void Engine::shutdown() {
     m_irradianceMap.shutdown();
     m_prefilteredMap.shutdown();
     m_brdfLUT.shutdown();
+
+    m_ssaoRaw.shutdown();
+    m_ssaoBlurred.shutdown();
+    m_ssaoNoise.shutdown();
+    m_ssaoKernelBuffer.shutdown();
+
+    for (uint32_t i = 0; i < BLOOM_MIP_COUNT; i++) {
+        if (m_bloomMipViews[i]) {
+            vkDestroyImageView(device, m_bloomMipViews[i], nullptr);
+            m_bloomMipViews[i] = VK_NULL_HANDLE;
+        }
+    }
+    m_bloomMipChain.shutdown();
 
     for (auto& ub : m_uniformBuffers) ub.shutdown();
     for (auto& plb : m_pointLightBuffers) plb.shutdown();

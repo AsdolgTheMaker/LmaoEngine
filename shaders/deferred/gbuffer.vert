@@ -17,6 +17,9 @@ layout(set = 0, binding = 0) uniform GlobalUBO {
     mat4 cascadeViewProj[3];
     vec4 cascadeSplits;
     float iblIntensity;
+    float ssaoRadius;
+    float ssaoBias;
+    float bloomIntensity;
 };
 
 layout(push_constant) uniform PushConstants {

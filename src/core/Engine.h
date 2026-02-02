@@ -12,6 +12,7 @@
 #include "vulkan/Pipeline.h"
 #include "scene/Scene.h"
 #include "math/MathUtils.h"
+#include <imgui.h>
 #include <memory>
 #include <vector>
 
@@ -33,6 +34,7 @@ enum class DebugMode : uint32_t {
     Roughness = 3,
     Normals = 4,
     Depth = 5,
+    SSAO = 6,
     Cascades = 7,
 };
 
@@ -51,22 +53,31 @@ private:
     static constexpr uint32_t SHADOW_MAP_SIZE = 4096;
     static constexpr uint32_t SHADOW_CASCADE_COUNT = 3;
     static constexpr float SHADOW_DISTANCE = 100.0f;
+    static constexpr uint32_t BLOOM_MIP_COUNT = 6;
 
     bool initShadowPass();
     bool initGBufferPass();
     void initIBL();
     bool initLightingPass();
     bool initSkyboxPass();
+    bool initSSAOPass();
+    bool initBloomPass();
     bool initMotionPass();
     bool initTAAPass();
     bool initTonemapPass();
     bool initFXAAPass();
+    bool initImGui();
+    void buildImGui();
+    void recordImGuiPass(VkCommandBuffer cmd, uint32_t imageIndex);
     void setupDemoScene();
     void recordCommands(VkCommandBuffer cmd, uint32_t imageIndex);
     void recordShadowPass(VkCommandBuffer cmd);
     void recordGBufferPass(VkCommandBuffer cmd);
+    void recordSSAOPass(VkCommandBuffer cmd);
+    void recordSSAOBlurPass(VkCommandBuffer cmd);
     void recordLightingPass(VkCommandBuffer cmd);
     void recordSkyboxPass(VkCommandBuffer cmd);
+    void recordBloomPass(VkCommandBuffer cmd);
     void recordMotionPass(VkCommandBuffer cmd);
     void recordTAAPass(VkCommandBuffer cmd);
     void recordTonemapPass(VkCommandBuffer cmd);
@@ -79,6 +90,8 @@ private:
     void createTAAImages();
     void createLDRImage();
     void createShadowMap();
+    void createSSAOImages();
+    void createBloomImages();
     void computeCascades(mat4 cascadeVP[SHADOW_CASCADE_COUNT], vec4& splits);
     void updateLightingDescriptors();
     void updateAADescriptors();
@@ -123,6 +136,18 @@ private:
     Image m_brdfLUT;           // 512x512 BRDF integration LUT
     VkSampler m_cubemapSampler = VK_NULL_HANDLE;
 
+    // SSAO resources
+    Image m_ssaoRaw;           // half-res R8_UNORM
+    Image m_ssaoBlurred;       // half-res R8_UNORM
+    Image m_ssaoNoise;         // 4x4 RG16F noise texture
+    Buffer m_ssaoKernelBuffer; // 64 vec4 hemisphere kernel
+
+    // Bloom resources
+    Image m_bloomMipChain;     // half-res RGBA16F, BLOOM_MIP_COUNT mips
+    VkImageView m_bloomMipViews[BLOOM_MIP_COUNT]{};
+    VkDescriptorSet m_bloomDownSets[BLOOM_MIP_COUNT]{}; // source texture per downsample step
+    VkDescriptorSet m_bloomUpSets[BLOOM_MIP_COUNT]{};   // source texture per upsample step
+
     // Scene
     Scene m_scene;
 
@@ -138,6 +163,29 @@ private:
     ShaderModule m_skyboxFrag;
     VkDescriptorSetLayout m_skyboxSetLayout = VK_NULL_HANDLE;
     VkDescriptorSet m_skyboxSet = VK_NULL_HANDLE;
+
+    // SSAO pass
+    VkPipelineLayout m_ssaoPipelineLayout = VK_NULL_HANDLE;
+    VkPipeline m_ssaoPipeline = VK_NULL_HANDLE;
+    ShaderModule m_ssaoFrag;
+    VkDescriptorSetLayout m_ssaoSetLayout = VK_NULL_HANDLE;
+    VkDescriptorSet m_ssaoSet = VK_NULL_HANDLE;
+
+    // SSAO blur pass
+    VkPipelineLayout m_ssaoBlurPipelineLayout = VK_NULL_HANDLE;
+    VkPipeline m_ssaoBlurPipeline = VK_NULL_HANDLE;
+    ShaderModule m_ssaoBlurFrag;
+    VkDescriptorSetLayout m_ssaoBlurSetLayout = VK_NULL_HANDLE;
+    VkDescriptorSet m_ssaoBlurSet = VK_NULL_HANDLE;
+
+    // Bloom pass
+    VkPipelineLayout m_bloomDownPipelineLayout = VK_NULL_HANDLE;
+    VkPipeline m_bloomDownPipeline = VK_NULL_HANDLE;
+    ShaderModule m_bloomDownFrag;
+    VkPipelineLayout m_bloomUpPipelineLayout = VK_NULL_HANDLE;
+    VkPipeline m_bloomUpPipeline = VK_NULL_HANDLE;
+    ShaderModule m_bloomUpFrag;
+    VkDescriptorSetLayout m_bloomSetLayout = VK_NULL_HANDLE;
 
     // G-Buffer pass
     VkPipelineLayout m_gbufferPipelineLayout = VK_NULL_HANDLE;
@@ -182,6 +230,7 @@ private:
     VkSampler m_nearestSampler = VK_NULL_HANDLE; // nearest, clamp-to-edge
     VkSampler m_linearSampler = VK_NULL_HANDLE;  // linear, clamp-to-edge
     VkSampler m_shadowSampler = VK_NULL_HANDLE;  // comparison sampler for shadow maps
+    VkSampler m_repeatSampler = VK_NULL_HANDLE;  // nearest, repeat
 
     // Point lights SSBO
     Buffer m_pointLightBuffers[MAX_SWAPCHAIN_IMAGES];
@@ -208,7 +257,9 @@ private:
         mat4 cascadeViewProj[3];
         vec4 cascadeSplits;   // xyz = split depths (view-space), w = shadow bias
         float iblIntensity;
-        float _pad6[3];
+        float ssaoRadius;
+        float ssaoBias;
+        float bloomIntensity;
     };
 
     // Previous frame state for TAA
@@ -216,6 +267,18 @@ private:
 
     // Cascade shadow map VP matrices (computed per frame, used by recordShadowPass)
     mat4 m_cascadeVP[SHADOW_CASCADE_COUNT];
+
+    // ImGui
+    VkDescriptorPool m_imguiPool = VK_NULL_HANDLE;
+    bool m_imguiInitialized = false;
+
+    // UI parameters
+    bool m_ssaoEnabled = true;
+    bool m_bloomEnabled = true;
+    float m_bloomIntensityUI = 0.04f;
+    float m_ssaoRadiusUI = 0.5f;
+    float m_ssaoBiasUI = 0.025f;
+    float m_iblIntensityUI = 1.0f;
 
     // Debug
     DebugMode m_debugMode = DebugMode::Final;
