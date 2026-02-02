@@ -5,13 +5,15 @@ layout(set = 0, binding = 0) uniform GlobalUBO {
     mat4 proj;
     mat4 viewProj;
     mat4 invViewProj;
+    mat4 prevViewProj;
     vec4 cameraPos;
     float time;
     uint pointLightCount;
-    float _pad0;
-    float _pad1;
+    float jitterX;
+    float jitterY;
     vec4 dirLightDir;
     vec4 dirLightColor;
+    vec4 resolution;
 };
 
 layout(push_constant) uniform PushConstants {

@@ -47,20 +47,32 @@ public:
 private:
     static constexpr uint32_t MAX_SWAPCHAIN_IMAGES = 4;
     static constexpr uint32_t MAX_POINT_LIGHTS = 256;
+    static constexpr VkSampleCountFlagBits MSAA_SAMPLES = VK_SAMPLE_COUNT_4_BIT;
 
     bool initGBufferPass();
     bool initLightingPass();
+    bool initMotionPass();
+    bool initTAAPass();
     bool initTonemapPass();
+    bool initFXAAPass();
     void setupDemoScene();
     void recordCommands(VkCommandBuffer cmd, uint32_t imageIndex);
     void recordGBufferPass(VkCommandBuffer cmd);
     void recordLightingPass(VkCommandBuffer cmd);
-    void recordTonemapPass(VkCommandBuffer cmd, uint32_t imageIndex);
+    void recordMotionPass(VkCommandBuffer cmd);
+    void recordTAAPass(VkCommandBuffer cmd);
+    void recordTonemapPass(VkCommandBuffer cmd);
+    void recordFXAAPass(VkCommandBuffer cmd, uint32_t imageIndex);
     void drawFrame();
     void handleResize();
     void createGBufferImages();
+    void createMSAAImages();
     void createHDRImage();
+    void createVelocityImage();
+    void createTAAImages();
+    void createLDRImage();
     void updateLightingDescriptors();
+    void updateAADescriptors();
 
     Window m_window;
     Timer m_timer;
@@ -71,17 +83,33 @@ private:
     DescriptorManager m_descriptors;
 
     std::vector<VkCommandBuffer> m_cmdBuffers;
+
+    // Single-sample images (resolve targets + sampled)
     Image m_depthImage;
-
-    // Scene
-    Scene m_scene;
-
-    // G-Buffer images
     Image m_gbufferRT0; // RGB = albedo, A = metallic
     Image m_gbufferRT1; // RGB = world normal, A = roughness
 
-    // HDR target
+    // MSAA images (G-buffer primary attachments)
+    Image m_gbufferRT0_MS;
+    Image m_gbufferRT1_MS;
+    Image m_depthImage_MS;
+
+    // HDR target (lighting output)
     Image m_hdrImage;
+
+    // Velocity buffer (motion vectors)
+    Image m_velocityImage;
+
+    // TAA history (ping-pong)
+    Image m_taaHistory[2];
+    uint32_t m_taaCurrentIdx = 0;
+    uint32_t m_frameCount = 0;
+
+    // LDR intermediate (tonemap output, FXAA input)
+    Image m_ldrImage;
+
+    // Scene
+    Scene m_scene;
 
     // G-Buffer pass
     VkPipelineLayout m_gbufferPipelineLayout = VK_NULL_HANDLE;
@@ -95,18 +123,36 @@ private:
     VkPipeline m_lightingPipeline = VK_NULL_HANDLE;
     ShaderModule m_fullscreenVert;
     ShaderModule m_lightingFrag;
-    VkDescriptorSetLayout m_lightingSetLayout = VK_NULL_HANDLE;
-    VkDescriptorSet m_lightingSets[MAX_SWAPCHAIN_IMAGES]{};
+
+    // Motion vectors pass
+    VkPipelineLayout m_motionPipelineLayout = VK_NULL_HANDLE;
+    VkPipeline m_motionPipeline = VK_NULL_HANDLE;
+    ShaderModule m_motionFrag;
+
+    // TAA pass
+    VkPipelineLayout m_taaPipelineLayout = VK_NULL_HANDLE;
+    VkPipeline m_taaPipeline = VK_NULL_HANDLE;
+    ShaderModule m_taaFrag;
+    VkDescriptorSetLayout m_taaSetLayout = VK_NULL_HANDLE;
+    VkDescriptorSet m_taaSets[2]{}; // ping-pong
 
     // Tonemap pass
     VkPipelineLayout m_tonemapPipelineLayout = VK_NULL_HANDLE;
     VkPipeline m_tonemapPipeline = VK_NULL_HANDLE;
     ShaderModule m_tonemapFrag;
     VkDescriptorSetLayout m_tonemapSetLayout = VK_NULL_HANDLE;
-    VkDescriptorSet m_tonemapSet = VK_NULL_HANDLE;
+    VkDescriptorSet m_tonemapSets[2]{}; // ping-pong (reads alternating TAA output)
 
-    // G-Buffer sampler (nearest, clamp-to-edge)
-    VkSampler m_gbufferSampler = VK_NULL_HANDLE;
+    // FXAA pass
+    VkPipelineLayout m_fxaaPipelineLayout = VK_NULL_HANDLE;
+    VkPipeline m_fxaaPipeline = VK_NULL_HANDLE;
+    ShaderModule m_fxaaFrag;
+    VkDescriptorSetLayout m_fxaaSetLayout = VK_NULL_HANDLE;
+    VkDescriptorSet m_fxaaSet = VK_NULL_HANDLE;
+
+    // Samplers
+    VkSampler m_nearestSampler = VK_NULL_HANDLE; // nearest, clamp-to-edge
+    VkSampler m_linearSampler = VK_NULL_HANDLE;  // linear, clamp-to-edge
 
     // Point lights SSBO
     Buffer m_pointLightBuffers[MAX_SWAPCHAIN_IMAGES];
@@ -118,16 +164,22 @@ private:
 
     struct GlobalUBO {
         mat4 view;
-        mat4 proj;
-        mat4 viewProj;
-        mat4 invViewProj;
+        mat4 proj;            // jittered
+        mat4 viewProj;        // jittered
+        mat4 invViewProj;     // jittered
+        mat4 prevViewProj;    // unjittered previous
         vec4 cameraPos;
         float time;
         uint32_t pointLightCount;
-        float _pad0[2];
-        vec4 dirLightDir;   // xyz = direction, w unused
-        vec4 dirLightColor; // xyz = color, w = intensity
+        float jitterX;
+        float jitterY;
+        vec4 dirLightDir;     // xyz = direction, w unused
+        vec4 dirLightColor;   // xyz = color, w = intensity
+        vec4 resolution;      // xy = width/height, zw = 1/width, 1/height
     };
+
+    // Previous frame state for TAA
+    mat4 m_prevViewProj{1.0f};
 
     // Debug
     DebugMode m_debugMode = DebugMode::Final;

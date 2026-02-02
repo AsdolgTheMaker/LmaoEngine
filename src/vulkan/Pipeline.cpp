@@ -94,6 +94,11 @@ PipelineBuilder& PipelineBuilder::setColorBlendAttachment(uint32_t count, bool b
     return *this;
 }
 
+PipelineBuilder& PipelineBuilder::setMultisample(VkSampleCountFlagBits samples) {
+    m_multisample.rasterizationSamples = samples;
+    return *this;
+}
+
 PipelineBuilder& PipelineBuilder::setDynamicStates(const std::vector<VkDynamicState>& states) {
     m_dynamicStates = states;
     return *this;

@@ -93,6 +93,16 @@ std::shared_ptr<Texture> createBrickNormalMap(VulkanContext& ctx, CommandPool& c
     tex->initFromImage(ctx.device(), std::move(image), true, 1.0f);
     return tex;
 }
+
+float halton(int index, int base) {
+    float f = 1.0f, result = 0.0f;
+    while (index > 0) {
+        f /= static_cast<float>(base);
+        result += f * static_cast<float>(index % base);
+        index /= base;
+    }
+    return result;
+}
 } // anonymous namespace
 
 Engine::~Engine() { shutdown(); }
@@ -101,7 +111,7 @@ bool Engine::init() {
     WindowConfig wc{};
     wc.width = 1600;
     wc.height = 900;
-    wc.title = "LmaoEngine - Deferred PBR";
+    wc.title = "LmaoEngine - Deferred PBR + AA";
     if (!m_window.init(wc)) return false;
 
     Input::init(m_window.handle());
@@ -114,12 +124,14 @@ bool Engine::init() {
     if (!m_swapchain.init(m_vkCtx, m_window.width(), m_window.height())) return false;
     LOG(Core, Debug, "Swapchain image count: %u", m_swapchain.imageCount());
     if (!m_cmdPool.init(m_vkCtx.device(), m_vkCtx.queueFamilies().graphics)) return false;
-    if (!m_frameSync.init(m_vkCtx.device(), m_swapchain.imageCount())) return false;
+    // Use 1 frame in flight to avoid TAA ping-pong data race
+    // (2 history buffers require the previous frame's TAA write to be complete)
+    if (!m_frameSync.init(m_vkCtx.device(), 1)) return false;
     if (!m_descriptors.init(m_vkCtx.device())) return false;
 
-    m_cmdBuffers = m_cmdPool.allocate(m_swapchain.imageCount());
+    m_cmdBuffers = m_cmdPool.allocate(1);
 
-    // Depth image (used by G-buffer pass, also sampled in lighting pass)
+    // Single-sample depth (resolve target, also sampled in lighting + motion)
     Image::CreateInfo depthCI{};
     depthCI.width = m_swapchain.extent().width;
     depthCI.height = m_swapchain.extent().height;
@@ -128,26 +140,57 @@ bool Engine::init() {
     depthCI.aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
     if (!m_depthImage.init(m_vkCtx.allocator(), m_vkCtx.device(), depthCI)) return false;
 
-    // G-Buffer images
+    // G-Buffer images (single-sample resolve targets)
     createGBufferImages();
+
+    // MSAA images
+    createMSAAImages();
 
     // HDR image
     createHDRImage();
 
-    // G-Buffer sampler (nearest, clamp-to-edge)
-    VkSamplerCreateInfo sampCI{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
-    sampCI.magFilter = VK_FILTER_NEAREST;
-    sampCI.minFilter = VK_FILTER_NEAREST;
-    sampCI.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-    sampCI.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    sampCI.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    sampCI.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    VK_CHECK(vkCreateSampler(m_vkCtx.device(), &sampCI, nullptr, &m_gbufferSampler));
+    // Velocity image
+    createVelocityImage();
+
+    // TAA history images
+    createTAAImages();
+
+    // Transition TAA history to valid layout (avoids UNDEFINED when referenced by descriptors)
+    m_cmdPool.submitImmediate(m_vkCtx.graphicsQueue(), [&](VkCommandBuffer cmd) {
+        Image::transitionLayout(cmd, m_taaHistory[0].handle(),
+            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        Image::transitionLayout(cmd, m_taaHistory[1].handle(),
+            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    });
+
+    // LDR image
+    createLDRImage();
+
+    // Nearest sampler (for G-buffer, velocity)
+    {
+        VkSamplerCreateInfo sampCI{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        sampCI.magFilter = VK_FILTER_NEAREST;
+        sampCI.minFilter = VK_FILTER_NEAREST;
+        sampCI.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        sampCI.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        sampCI.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        sampCI.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        VK_CHECK(vkCreateSampler(m_vkCtx.device(), &sampCI, nullptr, &m_nearestSampler));
+    }
+
+    // Linear sampler (for TAA history, FXAA, HDR)
+    {
+        VkSamplerCreateInfo sampCI{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        sampCI.magFilter = VK_FILTER_LINEAR;
+        sampCI.minFilter = VK_FILTER_LINEAR;
+        sampCI.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        sampCI.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        sampCI.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        sampCI.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        VK_CHECK(vkCreateSampler(m_vkCtx.device(), &sampCI, nullptr, &m_linearSampler));
+    }
 
     // Global UBO + point light SSBO descriptor set layout
-    // For the G-buffer pass, we only need binding 0 (UBO) and binding 1 (SSBO)
-    // For the lighting pass, we also need bindings 2-4 (G-buffer samplers)
-    // We use a single layout with all 5 bindings for simplicity
     VkDescriptorSetLayoutBinding globalBindings[5] = {
         {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1,
          VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
@@ -188,12 +231,18 @@ bool Engine::init() {
 
     if (!initGBufferPass()) return false;
     if (!initLightingPass()) return false;
+    if (!initMotionPass()) return false;
+    if (!initTAAPass()) return false;
     if (!initTonemapPass()) return false;
+    if (!initFXAAPass()) return false;
+
+    // Initialize AA descriptor sets
+    updateAADescriptors();
 
     setupDemoScene();
 
     m_timer.reset();
-    LOG(Core, Info, "Engine initialized (deferred PBR)");
+    LOG(Core, Info, "Engine initialized (deferred PBR + MSAA/TAA/FXAA)");
     return true;
 }
 
@@ -218,6 +267,38 @@ void Engine::createGBufferImages() {
     m_gbufferRT1.init(m_vkCtx.allocator(), m_vkCtx.device(), rt1CI);
 }
 
+void Engine::createMSAAImages() {
+    uint32_t w = m_swapchain.extent().width;
+    uint32_t h = m_swapchain.extent().height;
+
+    Image::CreateInfo rt0CI{};
+    rt0CI.width = w;
+    rt0CI.height = h;
+    rt0CI.format = VK_FORMAT_R8G8B8A8_UNORM;
+    rt0CI.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    rt0CI.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+    rt0CI.samples = MSAA_SAMPLES;
+    m_gbufferRT0_MS.init(m_vkCtx.allocator(), m_vkCtx.device(), rt0CI);
+
+    Image::CreateInfo rt1CI{};
+    rt1CI.width = w;
+    rt1CI.height = h;
+    rt1CI.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+    rt1CI.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    rt1CI.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+    rt1CI.samples = MSAA_SAMPLES;
+    m_gbufferRT1_MS.init(m_vkCtx.allocator(), m_vkCtx.device(), rt1CI);
+
+    Image::CreateInfo depthCI{};
+    depthCI.width = w;
+    depthCI.height = h;
+    depthCI.format = VK_FORMAT_D32_SFLOAT;
+    depthCI.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    depthCI.aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
+    depthCI.samples = MSAA_SAMPLES;
+    m_depthImage_MS.init(m_vkCtx.allocator(), m_vkCtx.device(), depthCI);
+}
+
 void Engine::createHDRImage() {
     Image::CreateInfo hdrCI{};
     hdrCI.width = m_swapchain.extent().width;
@@ -228,23 +309,90 @@ void Engine::createHDRImage() {
     m_hdrImage.init(m_vkCtx.allocator(), m_vkCtx.device(), hdrCI);
 }
 
+void Engine::createVelocityImage() {
+    Image::CreateInfo velCI{};
+    velCI.width = m_swapchain.extent().width;
+    velCI.height = m_swapchain.extent().height;
+    velCI.format = VK_FORMAT_R16G16_SFLOAT;
+    velCI.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    velCI.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+    m_velocityImage.init(m_vkCtx.allocator(), m_vkCtx.device(), velCI);
+}
+
+void Engine::createTAAImages() {
+    for (int i = 0; i < 2; i++) {
+        Image::CreateInfo ci{};
+        ci.width = m_swapchain.extent().width;
+        ci.height = m_swapchain.extent().height;
+        ci.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+        ci.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        ci.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+        m_taaHistory[i].init(m_vkCtx.allocator(), m_vkCtx.device(), ci);
+    }
+}
+
+void Engine::createLDRImage() {
+    Image::CreateInfo ci{};
+    ci.width = m_swapchain.extent().width;
+    ci.height = m_swapchain.extent().height;
+    ci.format = m_swapchain.imageFormat();
+    ci.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    ci.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+    m_ldrImage.init(m_vkCtx.allocator(), m_vkCtx.device(), ci);
+}
+
 void Engine::updateLightingDescriptors() {
     for (uint32_t i = 0; i < m_swapchain.imageCount(); i++) {
         DescriptorManager::writeImage(m_vkCtx.device(), m_globalSets[i], 2,
-            m_gbufferRT0.view(), m_gbufferSampler);
+            m_gbufferRT0.view(), m_nearestSampler);
         DescriptorManager::writeImage(m_vkCtx.device(), m_globalSets[i], 3,
-            m_gbufferRT1.view(), m_gbufferSampler);
+            m_gbufferRT1.view(), m_nearestSampler);
         DescriptorManager::writeImage(m_vkCtx.device(), m_globalSets[i], 4,
-            m_depthImage.view(), m_gbufferSampler);
+            m_depthImage.view(), m_nearestSampler);
+    }
+}
+
+void Engine::updateAADescriptors() {
+    VkDevice device = m_vkCtx.device();
+
+    // TAA descriptor sets (ping-pong)
+    for (int i = 0; i < 2; i++) {
+        if (!m_taaSets[i] && m_taaSetLayout) {
+            m_taaSets[i] = m_descriptors.allocate(m_taaSetLayout);
+        }
+        if (m_taaSets[i]) {
+            // binding 0: current HDR (linear sampler for good quality)
+            DescriptorManager::writeImage(device, m_taaSets[i], 0,
+                m_hdrImage.view(), m_linearSampler);
+            // binding 1: velocity (nearest)
+            DescriptorManager::writeImage(device, m_taaSets[i], 1,
+                m_velocityImage.view(), m_nearestSampler);
+            // binding 2: history (linear for sub-pixel sampling)
+            DescriptorManager::writeImage(device, m_taaSets[i], 2,
+                m_taaHistory[i].view(), m_linearSampler);
+        }
     }
 
-    // Tonemap descriptor set
-    if (!m_tonemapSet && m_tonemapSetLayout) {
-        m_tonemapSet = m_descriptors.allocate(m_tonemapSetLayout);
+    // Tonemap descriptor sets (ping-pong, reads TAA output)
+    for (int i = 0; i < 2; i++) {
+        if (!m_tonemapSets[i] && m_tonemapSetLayout) {
+            m_tonemapSets[i] = m_descriptors.allocate(m_tonemapSetLayout);
+        }
+        if (m_tonemapSets[i]) {
+            // When taaCurrentIdx == i, TAA writes to history[1-i]
+            // So tonemap reads history[1-i]
+            DescriptorManager::writeImage(device, m_tonemapSets[i], 0,
+                m_taaHistory[1 - i].view(), m_linearSampler);
+        }
     }
-    if (m_tonemapSet) {
-        DescriptorManager::writeImage(m_vkCtx.device(), m_tonemapSet, 0,
-            m_hdrImage.view(), m_gbufferSampler);
+
+    // FXAA descriptor set
+    if (!m_fxaaSet && m_fxaaSetLayout) {
+        m_fxaaSet = m_descriptors.allocate(m_fxaaSetLayout);
+    }
+    if (m_fxaaSet) {
+        DescriptorManager::writeImage(device, m_fxaaSet, 0,
+            m_ldrImage.view(), m_linearSampler);
     }
 }
 
@@ -285,7 +433,7 @@ bool Engine::initGBufferPass() {
 
     vkDestroyDescriptorSetLayout(device, emptyLayout, nullptr);
 
-    // Build pipeline (2 color attachments + depth)
+    // Build pipeline (2 color attachments + depth, MSAA)
     auto binding = Vertex::bindingDesc();
     auto attrs = Vertex::attributeDescs();
 
@@ -298,10 +446,11 @@ bool Engine::initGBufferPass() {
         .setDepthFormat(VK_FORMAT_D32_SFLOAT)
         .setCullMode(VK_CULL_MODE_BACK_BIT, VK_FRONT_FACE_COUNTER_CLOCKWISE)
         .setDepthTest(true, true, VK_COMPARE_OP_GREATER_OR_EQUAL)
+        .setMultisample(MSAA_SAMPLES)
         .setLayout(m_gbufferPipelineLayout)
         .build(device);
 
-    LOG(Pipeline, Info, "G-Buffer pipeline created");
+    LOG(Pipeline, Info, "G-Buffer pipeline created (MSAA 4x)");
     return true;
 }
 
@@ -311,7 +460,6 @@ bool Engine::initLightingPass() {
     if (!m_fullscreenVert.loadFromFile(device, "shaders/deferred/fullscreen.vert.spv")) return false;
     if (!m_lightingFrag.loadFromFile(device, "shaders/deferred/lighting.frag.spv")) return false;
 
-    // Lighting pipeline layout: set 0 = global (with G-buffer samplers)
     VkDescriptorSetLayout setLayouts[] = {m_globalSetLayout};
 
     VkPushConstantRange pushRange{};
@@ -326,7 +474,6 @@ bool Engine::initLightingPass() {
     layoutCI.pPushConstantRanges = &pushRange;
     VK_CHECK(vkCreatePipelineLayout(device, &layoutCI, nullptr, &m_lightingPipelineLayout));
 
-    // Build pipeline (1 HDR color attachment, no depth)
     m_lightingPipeline = PipelineBuilder()
         .addShaderStage(m_fullscreenVert.stageInfo(VK_SHADER_STAGE_VERTEX_BIT))
         .addShaderStage(m_lightingFrag.stageInfo(VK_SHADER_STAGE_FRAGMENT_BIT))
@@ -340,23 +487,82 @@ bool Engine::initLightingPass() {
     return true;
 }
 
+bool Engine::initMotionPass() {
+    VkDevice device = m_vkCtx.device();
+
+    if (!m_motionFrag.loadFromFile(device, "shaders/deferred/motion.frag.spv")) return false;
+
+    // Motion pipeline layout: global set only, no push constants
+    VkDescriptorSetLayout setLayouts[] = {m_globalSetLayout};
+
+    VkPipelineLayoutCreateInfo layoutCI{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    layoutCI.setLayoutCount = 1;
+    layoutCI.pSetLayouts = setLayouts;
+    VK_CHECK(vkCreatePipelineLayout(device, &layoutCI, nullptr, &m_motionPipelineLayout));
+
+    m_motionPipeline = PipelineBuilder()
+        .addShaderStage(m_fullscreenVert.stageInfo(VK_SHADER_STAGE_VERTEX_BIT))
+        .addShaderStage(m_motionFrag.stageInfo(VK_SHADER_STAGE_FRAGMENT_BIT))
+        .setColorFormats({VK_FORMAT_R16G16_SFLOAT})
+        .setDepthTest(false, false)
+        .setCullMode(VK_CULL_MODE_NONE)
+        .setLayout(m_motionPipelineLayout)
+        .build(device);
+
+    LOG(Pipeline, Info, "Motion vectors pipeline created");
+    return true;
+}
+
+bool Engine::initTAAPass() {
+    VkDevice device = m_vkCtx.device();
+
+    if (!m_taaFrag.loadFromFile(device, "shaders/deferred/taa.frag.spv")) return false;
+
+    // TAA descriptor set layout: 3 samplers
+    VkDescriptorSetLayoutBinding taaBindings[3] = {
+        {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+        {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+        {2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+    };
+    m_taaSetLayout = m_descriptors.getOrCreateLayout(taaBindings, 3);
+
+    VkPushConstantRange pushRange{};
+    pushRange.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    pushRange.offset = 0;
+    pushRange.size = sizeof(uint32_t);
+
+    VkPipelineLayoutCreateInfo layoutCI{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    layoutCI.setLayoutCount = 1;
+    layoutCI.pSetLayouts = &m_taaSetLayout;
+    layoutCI.pushConstantRangeCount = 1;
+    layoutCI.pPushConstantRanges = &pushRange;
+    VK_CHECK(vkCreatePipelineLayout(device, &layoutCI, nullptr, &m_taaPipelineLayout));
+
+    m_taaPipeline = PipelineBuilder()
+        .addShaderStage(m_fullscreenVert.stageInfo(VK_SHADER_STAGE_VERTEX_BIT))
+        .addShaderStage(m_taaFrag.stageInfo(VK_SHADER_STAGE_FRAGMENT_BIT))
+        .setColorFormats({VK_FORMAT_R16G16B16A16_SFLOAT})
+        .setDepthTest(false, false)
+        .setCullMode(VK_CULL_MODE_NONE)
+        .setLayout(m_taaPipelineLayout)
+        .build(device);
+
+    LOG(Pipeline, Info, "TAA pipeline created");
+    return true;
+}
+
 bool Engine::initTonemapPass() {
     VkDevice device = m_vkCtx.device();
 
     if (!m_tonemapFrag.loadFromFile(device, "shaders/deferred/tonemap.frag.spv")) return false;
 
-    // Tonemap descriptor set layout: binding 0 = HDR sampler
+    // Tonemap descriptor set layout: binding 0 = HDR/TAA sampler
     VkDescriptorSetLayoutBinding tonemapBinding{};
     tonemapBinding.binding = 0;
     tonemapBinding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     tonemapBinding.descriptorCount = 1;
     tonemapBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     m_tonemapSetLayout = m_descriptors.getOrCreateLayout(&tonemapBinding, 1);
-
-    // Allocate and write tonemap descriptor set
-    m_tonemapSet = m_descriptors.allocate(m_tonemapSetLayout);
-    DescriptorManager::writeImage(m_vkCtx.device(), m_tonemapSet, 0,
-        m_hdrImage.view(), m_gbufferSampler);
 
     VkPushConstantRange pushRange{};
     pushRange.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
@@ -370,6 +576,7 @@ bool Engine::initTonemapPass() {
     layoutCI.pPushConstantRanges = &pushRange;
     VK_CHECK(vkCreatePipelineLayout(device, &layoutCI, nullptr, &m_tonemapPipelineLayout));
 
+    // Tonemap now outputs to LDR image (swapchain format), not directly to swapchain
     m_tonemapPipeline = PipelineBuilder()
         .addShaderStage(m_fullscreenVert.stageInfo(VK_SHADER_STAGE_VERTEX_BIT))
         .addShaderStage(m_tonemapFrag.stageInfo(VK_SHADER_STAGE_FRAGMENT_BIT))
@@ -380,6 +587,44 @@ bool Engine::initTonemapPass() {
         .build(device);
 
     LOG(Pipeline, Info, "Tonemap pipeline created");
+    return true;
+}
+
+bool Engine::initFXAAPass() {
+    VkDevice device = m_vkCtx.device();
+
+    if (!m_fxaaFrag.loadFromFile(device, "shaders/deferred/fxaa.frag.spv")) return false;
+
+    // FXAA descriptor set layout: binding 0 = LDR sampler
+    VkDescriptorSetLayoutBinding fxaaBinding{};
+    fxaaBinding.binding = 0;
+    fxaaBinding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    fxaaBinding.descriptorCount = 1;
+    fxaaBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    m_fxaaSetLayout = m_descriptors.getOrCreateLayout(&fxaaBinding, 1);
+
+    VkPushConstantRange pushRange{};
+    pushRange.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    pushRange.offset = 0;
+    pushRange.size = sizeof(float) * 2; // vec2 inverseScreenSize
+
+    VkPipelineLayoutCreateInfo layoutCI{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    layoutCI.setLayoutCount = 1;
+    layoutCI.pSetLayouts = &m_fxaaSetLayout;
+    layoutCI.pushConstantRangeCount = 1;
+    layoutCI.pPushConstantRanges = &pushRange;
+    VK_CHECK(vkCreatePipelineLayout(device, &layoutCI, nullptr, &m_fxaaPipelineLayout));
+
+    m_fxaaPipeline = PipelineBuilder()
+        .addShaderStage(m_fullscreenVert.stageInfo(VK_SHADER_STAGE_VERTEX_BIT))
+        .addShaderStage(m_fxaaFrag.stageInfo(VK_SHADER_STAGE_FRAGMENT_BIT))
+        .setColorFormats({m_swapchain.imageFormat()})
+        .setDepthTest(false, false)
+        .setCullMode(VK_CULL_MODE_NONE)
+        .setLayout(m_fxaaPipelineLayout)
+        .build(device);
+
+    LOG(Pipeline, Info, "FXAA pipeline created");
     return true;
 }
 
@@ -442,29 +687,24 @@ void Engine::setupDemoScene() {
     auto whiteTex = TextureLoader::createSolidColor(m_vkCtx, m_cmdPool, vec4(1, 1, 1, 1));
     auto checkerTex = TextureLoader::createCheckerboard(m_vkCtx, m_cmdPool, 512, 32);
 
-    // Default flat normal map (128, 128, 255) = (0.5, 0.5, 1.0) in tangent space -> pointing up
     auto flatNormalTex = TextureLoader::createSolidColor(m_vkCtx, m_cmdPool,
         vec4(128.0f/255.0f, 128.0f/255.0f, 1.0f, 1.0f), false);
 
-    // Default metallic-roughness map (white = full values from material params)
     auto defaultMRTex = TextureLoader::createSolidColor(m_vkCtx, m_cmdPool,
         vec4(1, 1, 1, 1), false);
 
-    // Procedural brick normal map
     auto brickNormalTex = createBrickNormalMap(m_vkCtx, m_cmdPool);
 
-    // Procedural metallic-roughness maps
     auto roughPlasticMR = TextureLoader::createSolidColor(m_vkCtx, m_cmdPool,
-        vec4(0, 1, 0, 1), false); // G=1.0 roughness, B=0.0 metallic
+        vec4(0, 1, 0, 1), false);
     auto polishedMetalMR = TextureLoader::createSolidColor(m_vkCtx, m_cmdPool,
-        vec4(0, 0.15f, 1, 1), false); // G=0.15 roughness, B=1.0 metallic
+        vec4(0, 0.15f, 1, 1), false);
     auto brushedMetalMR = TextureLoader::createSolidColor(m_vkCtx, m_cmdPool,
-        vec4(0, 0.4f, 1, 1), false); // G=0.4 roughness, B=1.0 metallic
+        vec4(0, 0.4f, 1, 1), false);
 
     m_textures = {whiteTex, checkerTex, flatNormalTex, defaultMRTex,
                   brickNormalTex, roughPlasticMR, polishedMetalMR, brushedMetalMR};
 
-    // Create materials with normal + metallic-roughness maps
     auto makeMat = [&](std::shared_ptr<Texture> albedo,
                        std::shared_ptr<Texture> normal,
                        std::shared_ptr<Texture> mr,
@@ -480,61 +720,44 @@ void Engine::setupDemoScene() {
         return mat;
     };
 
-    // Ground: brick normal map, rough dielectric
     auto groundMat = makeMat(checkerTex, brickNormalTex, defaultMRTex,
         vec4(1, 1, 1, 1), 0.0f, 0.8f, 1.0f);
-
-    // Red rough plastic cube
     auto redMat = makeMat(whiteTex, flatNormalTex, roughPlasticMR,
         vec4(0.9f, 0.15f, 0.1f, 1), 0.0f, 0.7f);
-
-    // Blue sphere: slightly metallic, smooth
     auto blueMat = makeMat(whiteTex, flatNormalTex, defaultMRTex,
         vec4(0.15f, 0.3f, 0.9f, 1), 0.3f, 0.2f);
-
-    // Gold torus: polished metal (MR texture controls roughness/metallic)
     auto goldMat = makeMat(whiteTex, flatNormalTex, polishedMetalMR,
         vec4(1.0f, 0.85f, 0.4f, 1), 1.0f, 1.0f);
-
-    // Green cylinder: diffuse
     auto greenMat = makeMat(whiteTex, flatNormalTex, defaultMRTex,
         vec4(0.2f, 0.8f, 0.3f, 1), 0.0f, 0.5f);
-
-    // Silver cone: brushed metal (MR texture controls roughness/metallic)
     auto silverMat = makeMat(whiteTex, flatNormalTex, brushedMetalMR,
         vec4(0.9f, 0.9f, 0.95f, 1), 1.0f, 1.0f);
 
-    // Ground plane
     auto& ground = m_scene.createEntity("Ground");
     ground.mesh = planeMesh;
     ground.material = groundMat;
 
-    // Cube
     auto& cube = m_scene.createEntity("Cube");
     cube.transform.position = {-3.0f, 0.75f, 0.0f};
     cube.transform.scale = vec3(1.5f);
     cube.mesh = cubeMesh;
     cube.material = redMat;
 
-    // Sphere
     auto& sphere = m_scene.createEntity("Sphere");
     sphere.transform.position = {0.0f, 1.0f, 0.0f};
     sphere.mesh = sphereMesh;
     sphere.material = blueMat;
 
-    // Torus
     auto& torus = m_scene.createEntity("Torus");
     torus.transform.position = {3.0f, 1.0f, 0.0f};
     torus.mesh = torusMesh;
     torus.material = goldMat;
 
-    // Cylinder
     auto& cyl = m_scene.createEntity("Cylinder");
     cyl.transform.position = {-1.5f, 1.0f, -3.0f};
     cyl.mesh = cylinderMesh;
     cyl.material = greenMat;
 
-    // Cone
     auto& cone = m_scene.createEntity("Cone");
     cone.transform.position = {1.5f, 0.75f, -3.0f};
     cone.mesh = coneMesh;
@@ -546,7 +769,16 @@ void Engine::setupDemoScene() {
 }
 
 void Engine::recordGBufferPass(VkCommandBuffer cmd) {
-    // Transition G-buffer images to color attachment
+    // Transition MSAA images to color/depth attachment
+    Image::transitionLayout(cmd, m_gbufferRT0_MS.handle(),
+        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    Image::transitionLayout(cmd, m_gbufferRT1_MS.handle(),
+        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    Image::transitionLayout(cmd, m_depthImage_MS.handle(),
+        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+        VK_IMAGE_ASPECT_DEPTH_BIT);
+
+    // Transition resolve targets to color/depth attachment
     Image::transitionLayout(cmd, m_gbufferRT0.handle(),
         VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     Image::transitionLayout(cmd, m_gbufferRT1.handle(),
@@ -557,26 +789,38 @@ void Engine::recordGBufferPass(VkCommandBuffer cmd) {
 
     VkRenderingAttachmentInfo colorAttachments[2]{};
 
+    // RT0: MSAA primary, resolve to single-sample
     colorAttachments[0] = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-    colorAttachments[0].imageView = m_gbufferRT0.view();
+    colorAttachments[0].imageView = m_gbufferRT0_MS.view();
     colorAttachments[0].imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     colorAttachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    colorAttachments[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    colorAttachments[0].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE; // MSAA not needed after resolve
     colorAttachments[0].clearValue.color = {{0.0f, 0.0f, 0.0f, 0.0f}};
+    colorAttachments[0].resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT;
+    colorAttachments[0].resolveImageView = m_gbufferRT0.view();
+    colorAttachments[0].resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 
+    // RT1: MSAA primary, resolve to single-sample
     colorAttachments[1] = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-    colorAttachments[1].imageView = m_gbufferRT1.view();
+    colorAttachments[1].imageView = m_gbufferRT1_MS.view();
     colorAttachments[1].imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     colorAttachments[1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    colorAttachments[1].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    colorAttachments[1].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
     colorAttachments[1].clearValue.color = {{0.5f, 0.5f, 1.0f, 0.0f}};
+    colorAttachments[1].resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT;
+    colorAttachments[1].resolveImageView = m_gbufferRT1.view();
+    colorAttachments[1].resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 
+    // Depth: MSAA primary, resolve to single-sample
     VkRenderingAttachmentInfo depthAttach{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-    depthAttach.imageView = m_depthImage.view();
+    depthAttach.imageView = m_depthImage_MS.view();
     depthAttach.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
     depthAttach.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    depthAttach.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    depthAttach.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
     depthAttach.clearValue.depthStencil = {0.0f, 0};
+    depthAttach.resolveMode = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
+    depthAttach.resolveImageView = m_depthImage.view();
+    depthAttach.resolveImageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
     VkRenderingInfo renderInfo{VK_STRUCTURE_TYPE_RENDERING_INFO};
     renderInfo.renderArea = {{0, 0}, m_swapchain.extent()};
@@ -626,7 +870,7 @@ void Engine::recordGBufferPass(VkCommandBuffer cmd) {
 
     vkCmdEndRendering(cmd);
 
-    // Transition G-buffer + depth to shader read
+    // Transition resolved images to shader read
     Image::transitionLayout(cmd, m_gbufferRT0.handle(),
         VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     Image::transitionLayout(cmd, m_gbufferRT1.handle(),
@@ -655,7 +899,6 @@ void Engine::recordLightingPass(VkCommandBuffer cmd) {
 
     vkCmdBeginRendering(cmd, &renderInfo);
 
-    // Normal (non-flipped) viewport for fullscreen passes
     VkViewport viewport{};
     viewport.x = 0;
     viewport.y = 0;
@@ -678,16 +921,166 @@ void Engine::recordLightingPass(VkCommandBuffer cmd) {
     vkCmdPushConstants(cmd, m_lightingPipelineLayout,
         VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(uint32_t), &debugMode);
 
-    vkCmdDraw(cmd, 3, 1, 0, 0); // Fullscreen triangle
+    vkCmdDraw(cmd, 3, 1, 0, 0);
 
     vkCmdEndRendering(cmd);
 
-    // Transition HDR to shader read for tonemap
+    // Transition HDR to shader read for TAA
     Image::transitionLayout(cmd, m_hdrImage.handle(),
         VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 }
 
-void Engine::recordTonemapPass(VkCommandBuffer cmd, uint32_t imageIndex) {
+void Engine::recordMotionPass(VkCommandBuffer cmd) {
+    Image::transitionLayout(cmd, m_velocityImage.handle(),
+        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+
+    VkRenderingAttachmentInfo colorAttach{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    colorAttach.imageView = m_velocityImage.view();
+    colorAttach.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    colorAttach.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    colorAttach.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    colorAttach.clearValue.color = {{0.0f, 0.0f, 0.0f, 0.0f}};
+
+    VkRenderingInfo renderInfo{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    renderInfo.renderArea = {{0, 0}, m_swapchain.extent()};
+    renderInfo.layerCount = 1;
+    renderInfo.colorAttachmentCount = 1;
+    renderInfo.pColorAttachments = &colorAttach;
+
+    vkCmdBeginRendering(cmd, &renderInfo);
+
+    VkViewport viewport{};
+    viewport.x = 0;
+    viewport.y = 0;
+    viewport.width = static_cast<float>(m_swapchain.extent().width);
+    viewport.height = static_cast<float>(m_swapchain.extent().height);
+    viewport.minDepth = 0.0f;
+    viewport.maxDepth = 1.0f;
+    vkCmdSetViewport(cmd, 0, 1, &viewport);
+
+    VkRect2D scissor{{0, 0}, m_swapchain.extent()};
+    vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_motionPipeline);
+
+    uint32_t frame = m_frameSync.currentFrame();
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+        m_motionPipelineLayout, 0, 1, &m_globalSets[frame], 0, nullptr);
+
+    vkCmdDraw(cmd, 3, 1, 0, 0);
+
+    vkCmdEndRendering(cmd);
+
+    // Transition velocity to shader read for TAA
+    Image::transitionLayout(cmd, m_velocityImage.handle(),
+        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+}
+
+void Engine::recordTAAPass(VkCommandBuffer cmd) {
+    // TAA reads from history[taaCurrentIdx], writes to history[1 - taaCurrentIdx]
+    uint32_t writeIdx = 1 - m_taaCurrentIdx;
+
+    Image::transitionLayout(cmd, m_taaHistory[writeIdx].handle(),
+        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+
+    // Ensure history read target is in shader read layout
+    // (It was either never written or was written last frame and left in shader read)
+
+    VkRenderingAttachmentInfo colorAttach{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    colorAttach.imageView = m_taaHistory[writeIdx].view();
+    colorAttach.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    colorAttach.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    colorAttach.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+
+    VkRenderingInfo renderInfo{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    renderInfo.renderArea = {{0, 0}, m_swapchain.extent()};
+    renderInfo.layerCount = 1;
+    renderInfo.colorAttachmentCount = 1;
+    renderInfo.pColorAttachments = &colorAttach;
+
+    vkCmdBeginRendering(cmd, &renderInfo);
+
+    VkViewport viewport{};
+    viewport.x = 0;
+    viewport.y = 0;
+    viewport.width = static_cast<float>(m_swapchain.extent().width);
+    viewport.height = static_cast<float>(m_swapchain.extent().height);
+    viewport.minDepth = 0.0f;
+    viewport.maxDepth = 1.0f;
+    vkCmdSetViewport(cmd, 0, 1, &viewport);
+
+    VkRect2D scissor{{0, 0}, m_swapchain.extent()};
+    vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_taaPipeline);
+
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+        m_taaPipelineLayout, 0, 1, &m_taaSets[m_taaCurrentIdx], 0, nullptr);
+
+    uint32_t firstFrame = (m_frameCount == 0) ? 1u : 0u;
+    vkCmdPushConstants(cmd, m_taaPipelineLayout,
+        VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(uint32_t), &firstFrame);
+
+    vkCmdDraw(cmd, 3, 1, 0, 0);
+
+    vkCmdEndRendering(cmd);
+
+    // Transition TAA output to shader read for tonemap
+    Image::transitionLayout(cmd, m_taaHistory[writeIdx].handle(),
+        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+}
+
+void Engine::recordTonemapPass(VkCommandBuffer cmd) {
+    // Tonemap reads TAA output, writes to LDR image
+    Image::transitionLayout(cmd, m_ldrImage.handle(),
+        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+
+    VkRenderingAttachmentInfo colorAttach{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    colorAttach.imageView = m_ldrImage.view();
+    colorAttach.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    colorAttach.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    colorAttach.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+
+    VkRenderingInfo renderInfo{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    renderInfo.renderArea = {{0, 0}, m_swapchain.extent()};
+    renderInfo.layerCount = 1;
+    renderInfo.colorAttachmentCount = 1;
+    renderInfo.pColorAttachments = &colorAttach;
+
+    vkCmdBeginRendering(cmd, &renderInfo);
+
+    VkViewport viewport{};
+    viewport.x = 0;
+    viewport.y = 0;
+    viewport.width = static_cast<float>(m_swapchain.extent().width);
+    viewport.height = static_cast<float>(m_swapchain.extent().height);
+    viewport.minDepth = 0.0f;
+    viewport.maxDepth = 1.0f;
+    vkCmdSetViewport(cmd, 0, 1, &viewport);
+
+    VkRect2D scissor{{0, 0}, m_swapchain.extent()};
+    vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_tonemapPipeline);
+
+    // Use the tonemap set that reads from the current TAA write target
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+        m_tonemapPipelineLayout, 0, 1, &m_tonemapSets[m_taaCurrentIdx], 0, nullptr);
+
+    uint32_t debugMode = static_cast<uint32_t>(m_debugMode);
+    vkCmdPushConstants(cmd, m_tonemapPipelineLayout,
+        VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(uint32_t), &debugMode);
+
+    vkCmdDraw(cmd, 3, 1, 0, 0);
+
+    vkCmdEndRendering(cmd);
+
+    // Transition LDR to shader read for FXAA
+    Image::transitionLayout(cmd, m_ldrImage.handle(),
+        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+}
+
+void Engine::recordFXAAPass(VkCommandBuffer cmd, uint32_t imageIndex) {
     Image::transitionLayout(cmd, m_swapchain.image(imageIndex),
         VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 
@@ -717,16 +1110,19 @@ void Engine::recordTonemapPass(VkCommandBuffer cmd, uint32_t imageIndex) {
     VkRect2D scissor{{0, 0}, m_swapchain.extent()};
     vkCmdSetScissor(cmd, 0, 1, &scissor);
 
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_tonemapPipeline);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_fxaaPipeline);
 
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-        m_tonemapPipelineLayout, 0, 1, &m_tonemapSet, 0, nullptr);
+        m_fxaaPipelineLayout, 0, 1, &m_fxaaSet, 0, nullptr);
 
-    uint32_t debugMode = static_cast<uint32_t>(m_debugMode);
-    vkCmdPushConstants(cmd, m_tonemapPipelineLayout,
-        VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(uint32_t), &debugMode);
+    float inverseScreenSize[2] = {
+        1.0f / static_cast<float>(m_swapchain.extent().width),
+        1.0f / static_cast<float>(m_swapchain.extent().height)
+    };
+    vkCmdPushConstants(cmd, m_fxaaPipelineLayout,
+        VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(float) * 2, inverseScreenSize);
 
-    vkCmdDraw(cmd, 3, 1, 0, 0); // Fullscreen triangle
+    vkCmdDraw(cmd, 3, 1, 0, 0);
 
     vkCmdEndRendering(cmd);
 
@@ -738,9 +1134,12 @@ void Engine::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex) {
     VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     VK_CHECK(vkBeginCommandBuffer(cmd, &beginInfo));
 
-    recordGBufferPass(cmd);
-    recordLightingPass(cmd);
-    recordTonemapPass(cmd, imageIndex);
+    recordGBufferPass(cmd);    // MSAA G-buffer with auto-resolve
+    recordLightingPass(cmd);   // Read G-buffer, output HDR
+    recordMotionPass(cmd);     // Read depth, output velocity
+    recordTAAPass(cmd);        // Read HDR + velocity + history, output to history
+    recordTonemapPass(cmd);    // Read TAA output, output LDR
+    recordFXAAPass(cmd, imageIndex); // Read LDR, output to swapchain
 
     VK_CHECK(vkEndCommandBuffer(cmd));
 }
@@ -760,22 +1159,44 @@ void Engine::drawFrame() {
     // Update camera
     m_scene.camera().update(m_timer.dt());
 
+    // Compute TAA jitter (Halton 2,3 sequence)
+    float w = static_cast<float>(m_swapchain.extent().width);
+    float h = static_cast<float>(m_swapchain.extent().height);
+    int jitterIdx = static_cast<int>(m_frameCount % 16) + 1;
+    float jitterX = halton(jitterIdx, 2) - 0.5f;
+    float jitterY = halton(jitterIdx, 3) - 0.5f;
+
+    // Build jittered projection
+    mat4 baseProj = m_scene.camera().projectionMatrix();
+    mat4 jitteredProj = baseProj;
+    jitteredProj[2][0] += jitterX * 2.0f / w;
+    jitteredProj[2][1] += jitterY * 2.0f / h;
+
+    mat4 viewMat = m_scene.camera().viewMatrix();
+
     // Update UBO
     uint32_t frame = m_frameSync.currentFrame();
     GlobalUBO ubo{};
-    ubo.view = m_scene.camera().viewMatrix();
-    ubo.proj = m_scene.camera().projectionMatrix();
-    ubo.viewProj = ubo.proj * ubo.view;
+    ubo.view = viewMat;
+    ubo.proj = jitteredProj;
+    ubo.viewProj = jitteredProj * viewMat;
     ubo.invViewProj = glm::inverse(ubo.viewProj);
+    ubo.prevViewProj = m_prevViewProj;
     ubo.cameraPos = vec4(m_scene.camera().position(), 1.0f);
     ubo.time = m_timer.elapsed();
     ubo.pointLightCount = static_cast<uint32_t>(m_scene.pointLights().size());
+    ubo.jitterX = jitterX;
+    ubo.jitterY = jitterY;
 
     const auto& light = m_scene.directionalLight();
     ubo.dirLightDir = vec4(light.direction, 0.0f);
     ubo.dirLightColor = vec4(light.color, light.intensity);
+    ubo.resolution = vec4(w, h, 1.0f / w, 1.0f / h);
 
     m_uniformBuffers[frame].upload(&ubo, sizeof(ubo));
+
+    // Store unjittered viewProj for next frame's motion vectors
+    m_prevViewProj = baseProj * viewMat;
 
     // Upload point lights
     const auto& pointLights = m_scene.pointLights();
@@ -813,6 +1234,10 @@ void Engine::drawFrame() {
         handleResize();
     }
 
+    // Advance TAA ping-pong
+    m_taaCurrentIdx = 1 - m_taaCurrentIdx;
+    m_frameCount++;
+
     m_frameSync.advance();
 }
 
@@ -821,14 +1246,22 @@ void Engine::handleResize() {
     LOG(Swapchain, Info, "Resize triggered: %ux%u", m_window.width(), m_window.height());
     m_vkCtx.waitIdle();
 
+    // Shutdown all images
     m_depthImage.shutdown();
     m_gbufferRT0.shutdown();
     m_gbufferRT1.shutdown();
+    m_gbufferRT0_MS.shutdown();
+    m_gbufferRT1_MS.shutdown();
+    m_depthImage_MS.shutdown();
     m_hdrImage.shutdown();
+    m_velocityImage.shutdown();
+    m_taaHistory[0].shutdown();
+    m_taaHistory[1].shutdown();
+    m_ldrImage.shutdown();
 
     m_frameSync.shutdown();
     m_swapchain.recreate(m_vkCtx, m_window.width(), m_window.height());
-    m_frameSync.init(m_vkCtx.device(), m_swapchain.imageCount());
+    m_frameSync.init(m_vkCtx.device(), 1);
 
     Image::CreateInfo depthCI{};
     depthCI.width = m_swapchain.extent().width;
@@ -839,8 +1272,17 @@ void Engine::handleResize() {
     m_depthImage.init(m_vkCtx.allocator(), m_vkCtx.device(), depthCI);
 
     createGBufferImages();
+    createMSAAImages();
     createHDRImage();
+    createVelocityImage();
+    createTAAImages();
+    createLDRImage();
     updateLightingDescriptors();
+    updateAADescriptors();
+
+    // Reset TAA state on resize
+    m_taaCurrentIdx = 0;
+    m_frameCount = 0;
 
     float aspect = static_cast<float>(m_swapchain.extent().width) / m_swapchain.extent().height;
     m_scene.camera().setAspect(aspect);
@@ -892,23 +1334,40 @@ void Engine::shutdown() {
     if (m_gbufferPipelineLayout) vkDestroyPipelineLayout(device, m_gbufferPipelineLayout, nullptr);
     if (m_lightingPipeline) vkDestroyPipeline(device, m_lightingPipeline, nullptr);
     if (m_lightingPipelineLayout) vkDestroyPipelineLayout(device, m_lightingPipelineLayout, nullptr);
+    if (m_motionPipeline) vkDestroyPipeline(device, m_motionPipeline, nullptr);
+    if (m_motionPipelineLayout) vkDestroyPipelineLayout(device, m_motionPipelineLayout, nullptr);
+    if (m_taaPipeline) vkDestroyPipeline(device, m_taaPipeline, nullptr);
+    if (m_taaPipelineLayout) vkDestroyPipelineLayout(device, m_taaPipelineLayout, nullptr);
     if (m_tonemapPipeline) vkDestroyPipeline(device, m_tonemapPipeline, nullptr);
     if (m_tonemapPipelineLayout) vkDestroyPipelineLayout(device, m_tonemapPipelineLayout, nullptr);
+    if (m_fxaaPipeline) vkDestroyPipeline(device, m_fxaaPipeline, nullptr);
+    if (m_fxaaPipelineLayout) vkDestroyPipelineLayout(device, m_fxaaPipelineLayout, nullptr);
 
     m_gbufferVert.shutdown();
     m_gbufferFrag.shutdown();
     m_fullscreenVert.shutdown();
     m_lightingFrag.shutdown();
+    m_motionFrag.shutdown();
+    m_taaFrag.shutdown();
     m_tonemapFrag.shutdown();
+    m_fxaaFrag.shutdown();
 
-    if (m_gbufferSampler) vkDestroySampler(device, m_gbufferSampler, nullptr);
+    if (m_nearestSampler) vkDestroySampler(device, m_nearestSampler, nullptr);
+    if (m_linearSampler) vkDestroySampler(device, m_linearSampler, nullptr);
 
     for (auto& ub : m_uniformBuffers) ub.shutdown();
     for (auto& plb : m_pointLightBuffers) plb.shutdown();
 
     m_gbufferRT0.shutdown();
     m_gbufferRT1.shutdown();
+    m_gbufferRT0_MS.shutdown();
+    m_gbufferRT1_MS.shutdown();
+    m_depthImage_MS.shutdown();
     m_hdrImage.shutdown();
+    m_velocityImage.shutdown();
+    m_taaHistory[0].shutdown();
+    m_taaHistory[1].shutdown();
+    m_ldrImage.shutdown();
     m_depthImage.shutdown();
 
     m_descriptors.shutdown();

@@ -40,6 +40,13 @@ void main() {
     tangentNormal = normalize(tangentNormal);
     vec3 worldNormal = normalize(TBN * tangentNormal);
 
+    // Specular AA: adjust roughness based on normal map frequency
+    vec3 dNdx = dFdx(worldNormal);
+    vec3 dNdy = dFdy(worldNormal);
+    float normalVariance = dot(dNdx, dNdx) + dot(dNdy, dNdy);
+    finalRoughness = sqrt(finalRoughness * finalRoughness + normalVariance * 0.18);
+    finalRoughness = min(finalRoughness, 1.0);
+
     // Pack G-buffer
     outAlbedoMetallic = vec4(albedo, finalMetallic);
     outNormalRoughness = vec4(worldNormal * 0.5 + 0.5, finalRoughness);

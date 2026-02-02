@@ -18,6 +18,7 @@ public:
     PipelineBuilder& setCullMode(VkCullModeFlags mode, VkFrontFace front = VK_FRONT_FACE_COUNTER_CLOCKWISE);
     PipelineBuilder& setDepthTest(bool enable, bool write = true, VkCompareOp op = VK_COMPARE_OP_GREATER_OR_EQUAL);
     PipelineBuilder& setColorBlendAttachment(uint32_t count, bool blendEnable = false);
+    PipelineBuilder& setMultisample(VkSampleCountFlagBits samples);
     PipelineBuilder& setDynamicStates(const std::vector<VkDynamicState>& states);
     PipelineBuilder& setLayout(VkPipelineLayout layout);
 

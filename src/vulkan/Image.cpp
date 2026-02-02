@@ -9,7 +9,8 @@ Image::~Image() { release(); }
 Image::Image(Image&& o) noexcept
     : m_allocator(o.m_allocator), m_device(o.m_device), m_image(o.m_image),
       m_allocation(o.m_allocation), m_view(o.m_view), m_format(o.m_format),
-      m_width(o.m_width), m_height(o.m_height), m_mipLevels(o.m_mipLevels) {
+      m_width(o.m_width), m_height(o.m_height), m_mipLevels(o.m_mipLevels),
+      m_samples(o.m_samples) {
     o.m_image = VK_NULL_HANDLE;
     o.m_allocation = VK_NULL_HANDLE;
     o.m_view = VK_NULL_HANDLE;
@@ -27,6 +28,7 @@ Image& Image::operator=(Image&& o) noexcept {
         m_width = o.m_width;
         m_height = o.m_height;
         m_mipLevels = o.m_mipLevels;
+        m_samples = o.m_samples;
         o.m_image = VK_NULL_HANDLE;
         o.m_allocation = VK_NULL_HANDLE;
         o.m_view = VK_NULL_HANDLE;
@@ -41,6 +43,7 @@ bool Image::init(VmaAllocator allocator, VkDevice device, const CreateInfo& info
     m_width = info.width;
     m_height = info.height;
     m_mipLevels = info.mipLevels;
+    m_samples = info.samples;
 
     VkImageCreateInfo imgInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     imgInfo.imageType = VK_IMAGE_TYPE_2D;
@@ -48,7 +51,7 @@ bool Image::init(VmaAllocator allocator, VkDevice device, const CreateInfo& info
     imgInfo.extent = {info.width, info.height, 1};
     imgInfo.mipLevels = info.mipLevels;
     imgInfo.arrayLayers = info.arrayLayers;
-    imgInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    imgInfo.samples = info.samples;
     imgInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
     imgInfo.usage = info.usage;
     imgInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;

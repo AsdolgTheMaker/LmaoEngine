@@ -25,6 +25,7 @@ public:
         VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT;
         VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;
         VkImageViewType viewType = VK_IMAGE_VIEW_TYPE_2D;
+        VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
     };
 
     bool init(VmaAllocator allocator, VkDevice device, const CreateInfo& info);
@@ -36,6 +37,7 @@ public:
     uint32_t width() const { return m_width; }
     uint32_t height() const { return m_height; }
     uint32_t mipLevels() const { return m_mipLevels; }
+    VkSampleCountFlagBits samples() const { return m_samples; }
 
     // Transition image layout using a command buffer
     static void transitionLayout(VkCommandBuffer cmd, VkImage image,
@@ -53,6 +55,7 @@ private:
     VkImageView m_view = VK_NULL_HANDLE;
     VkFormat m_format = VK_FORMAT_UNDEFINED;
     uint32_t m_width = 0, m_height = 0, m_mipLevels = 1;
+    VkSampleCountFlagBits m_samples = VK_SAMPLE_COUNT_1_BIT;
 };
 
 } // namespace lmao
