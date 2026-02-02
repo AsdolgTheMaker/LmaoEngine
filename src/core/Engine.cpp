@@ -492,17 +492,17 @@ void Engine::setupDemoScene() {
     auto blueMat = makeMat(whiteTex, flatNormalTex, defaultMRTex,
         vec4(0.15f, 0.3f, 0.9f, 1), 0.3f, 0.2f);
 
-    // Gold torus: polished metal
+    // Gold torus: polished metal (MR texture controls roughness/metallic)
     auto goldMat = makeMat(whiteTex, flatNormalTex, polishedMetalMR,
-        vec4(1.0f, 0.85f, 0.4f, 1), 1.0f, 0.15f);
+        vec4(1.0f, 0.85f, 0.4f, 1), 1.0f, 1.0f);
 
     // Green cylinder: diffuse
     auto greenMat = makeMat(whiteTex, flatNormalTex, defaultMRTex,
         vec4(0.2f, 0.8f, 0.3f, 1), 0.0f, 0.5f);
 
-    // Silver cone: brushed metal
+    // Silver cone: brushed metal (MR texture controls roughness/metallic)
     auto silverMat = makeMat(whiteTex, flatNormalTex, brushedMetalMR,
-        vec4(0.9f, 0.9f, 0.95f, 1), 1.0f, 0.4f);
+        vec4(0.9f, 0.9f, 0.95f, 1), 1.0f, 1.0f);
 
     // Ground plane
     auto& ground = m_scene.createEntity("Ground");
