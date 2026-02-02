@@ -124,8 +124,8 @@ std::shared_ptr<Mesh> MeshGenerator::createSphere(VmaAllocator alloc, VkQueue qu
         for (uint32_t x = 0; x < segments; x++) {
             uint32_t a = y * (segments + 1) + x;
             uint32_t b = a + segments + 1;
-            idx.push_back(a); idx.push_back(b); idx.push_back(a + 1);
-            idx.push_back(a + 1); idx.push_back(b); idx.push_back(b + 1);
+            idx.push_back(a); idx.push_back(a + 1); idx.push_back(b);
+            idx.push_back(a + 1); idx.push_back(b + 1); idx.push_back(b);
         }
     }
 
@@ -201,8 +201,8 @@ std::shared_ptr<Mesh> MeshGenerator::createCylinder(VmaAllocator alloc, VkQueue 
 
     for (uint32_t i = 0; i < segments; i++) {
         uint32_t a = i * 2, b = a + 1, c = a + 2, d = a + 3;
-        idx.push_back(a); idx.push_back(b); idx.push_back(c);
-        idx.push_back(c); idx.push_back(b); idx.push_back(d);
+        idx.push_back(a); idx.push_back(c); idx.push_back(b);
+        idx.push_back(c); idx.push_back(d); idx.push_back(b);
     }
 
     // Top cap
@@ -218,8 +218,8 @@ std::shared_ptr<Mesh> MeshGenerator::createCylinder(VmaAllocator alloc, VkQueue 
     }
     for (uint32_t i = 0; i < segments; i++) {
         idx.push_back(topCenter);
-        idx.push_back(topCenter + 1 + i);
         idx.push_back(topCenter + 2 + i);
+        idx.push_back(topCenter + 1 + i);
     }
 
     // Bottom cap
@@ -235,8 +235,8 @@ std::shared_ptr<Mesh> MeshGenerator::createCylinder(VmaAllocator alloc, VkQueue 
     }
     for (uint32_t i = 0; i < segments; i++) {
         idx.push_back(botCenter);
-        idx.push_back(botCenter + 2 + i);
         idx.push_back(botCenter + 1 + i);
+        idx.push_back(botCenter + 2 + i);
     }
 
     computeTangents(verts, idx);
@@ -278,8 +278,8 @@ std::shared_ptr<Mesh> MeshGenerator::createCone(VmaAllocator alloc, VkQueue queu
 
     for (uint32_t i = 0; i < segments; i++) {
         uint32_t a = i * 2, b = a + 1, c = a + 2, d = a + 3;
-        idx.push_back(a); idx.push_back(b); idx.push_back(d);
-        idx.push_back(a); idx.push_back(d); idx.push_back(c);
+        idx.push_back(a); idx.push_back(d); idx.push_back(b);
+        idx.push_back(a); idx.push_back(c); idx.push_back(d);
     }
 
     // Base cap
@@ -295,8 +295,8 @@ std::shared_ptr<Mesh> MeshGenerator::createCone(VmaAllocator alloc, VkQueue queu
     }
     for (uint32_t i = 0; i < segments; i++) {
         idx.push_back(center);
-        idx.push_back(center + 2 + i);
         idx.push_back(center + 1 + i);
+        idx.push_back(center + 2 + i);
     }
 
     computeTangents(verts, idx);
@@ -336,8 +336,8 @@ std::shared_ptr<Mesh> MeshGenerator::createTorus(VmaAllocator alloc, VkQueue que
         for (uint32_t j = 0; j < minorSeg; j++) {
             uint32_t a = i * (minorSeg + 1) + j;
             uint32_t b = a + minorSeg + 1;
-            idx.push_back(a); idx.push_back(b); idx.push_back(a + 1);
-            idx.push_back(a + 1); idx.push_back(b); idx.push_back(b + 1);
+            idx.push_back(a); idx.push_back(a + 1); idx.push_back(b);
+            idx.push_back(a + 1); idx.push_back(b + 1); idx.push_back(b);
         }
     }
 
