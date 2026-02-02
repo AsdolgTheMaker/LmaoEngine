@@ -1,0 +1,47 @@
+# Build directories
+build/
+out/
+cmake-build-*/
+
+# IDE files
+.vs/
+.vscode/
+.idea/
+*.suo
+*.user
+*.sln.docstates
+CMakeSettings.json
+CMakePresets.json
+
+# Compiled shaders
+*.spv
+
+# Binary/object files
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dll
+*.dylib
+*.exe
+*.out
+*.pdb
+*.ilk
+*.exp
+
+# Dependencies (fetched by CMake)
+external/
+
+# OS files
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# Claude Code
+.claude/
+
+# Temporary files
+*.tmp
+*.swp
+*~
