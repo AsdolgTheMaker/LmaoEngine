@@ -6,7 +6,9 @@ layout(set = 0, binding = 0) uniform GlobalUBO {
     mat4 viewProj;
     vec4 cameraPos;
     float time;
-    float _pad0[3];
+    float _pad0;
+    float _pad1;
+    float _pad2;
     vec4 dirLightDir;   // xyz = direction
     vec4 dirLightColor; // xyz = color, w = intensity
 };
