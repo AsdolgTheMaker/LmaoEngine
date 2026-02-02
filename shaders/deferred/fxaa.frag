@@ -10,10 +10,10 @@ layout(location = 0) in vec2 fragUV;
 
 layout(location = 0) out vec4 outColor;
 
-// FXAA quality settings
-const float EDGE_THRESHOLD_MIN = 0.0625;
-const float EDGE_THRESHOLD_MAX = 0.166;
-const float SUBPIXEL_QUALITY = 0.5;
+// FXAA quality settings (conservative — TAA handles most AA, FXAA is cleanup only)
+const float EDGE_THRESHOLD_MIN = 0.0833;
+const float EDGE_THRESHOLD_MAX = 0.2;
+const float SUBPIXEL_QUALITY = 0.25;
 const int SEARCH_STEPS = 12;
 
 float luminance(vec3 c) {

@@ -131,7 +131,7 @@ bool Engine::init() {
 
     m_cmdBuffers = m_cmdPool.allocate(1);
 
-    // Single-sample depth (resolve target, also sampled in lighting + motion)
+    // Depth image (sampled in lighting + motion)
     Image::CreateInfo depthCI{};
     depthCI.width = m_swapchain.extent().width;
     depthCI.height = m_swapchain.extent().height;
@@ -140,11 +140,8 @@ bool Engine::init() {
     depthCI.aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
     if (!m_depthImage.init(m_vkCtx.allocator(), m_vkCtx.device(), depthCI)) return false;
 
-    // G-Buffer images (single-sample resolve targets)
+    // G-Buffer images
     createGBufferImages();
-
-    // MSAA images
-    createMSAAImages();
 
     // HDR image
     createHDRImage();
@@ -242,7 +239,7 @@ bool Engine::init() {
     setupDemoScene();
 
     m_timer.reset();
-    LOG(Core, Info, "Engine initialized (deferred PBR + MSAA/TAA/FXAA)");
+    LOG(Core, Info, "Engine initialized (deferred PBR + TAA/FXAA)");
     return true;
 }
 
@@ -265,38 +262,6 @@ void Engine::createGBufferImages() {
     rt1CI.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     rt1CI.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
     m_gbufferRT1.init(m_vkCtx.allocator(), m_vkCtx.device(), rt1CI);
-}
-
-void Engine::createMSAAImages() {
-    uint32_t w = m_swapchain.extent().width;
-    uint32_t h = m_swapchain.extent().height;
-
-    Image::CreateInfo rt0CI{};
-    rt0CI.width = w;
-    rt0CI.height = h;
-    rt0CI.format = VK_FORMAT_R8G8B8A8_UNORM;
-    rt0CI.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-    rt0CI.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
-    rt0CI.samples = MSAA_SAMPLES;
-    m_gbufferRT0_MS.init(m_vkCtx.allocator(), m_vkCtx.device(), rt0CI);
-
-    Image::CreateInfo rt1CI{};
-    rt1CI.width = w;
-    rt1CI.height = h;
-    rt1CI.format = VK_FORMAT_R16G16B16A16_SFLOAT;
-    rt1CI.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-    rt1CI.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
-    rt1CI.samples = MSAA_SAMPLES;
-    m_gbufferRT1_MS.init(m_vkCtx.allocator(), m_vkCtx.device(), rt1CI);
-
-    Image::CreateInfo depthCI{};
-    depthCI.width = w;
-    depthCI.height = h;
-    depthCI.format = VK_FORMAT_D32_SFLOAT;
-    depthCI.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
-    depthCI.aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
-    depthCI.samples = MSAA_SAMPLES;
-    m_depthImage_MS.init(m_vkCtx.allocator(), m_vkCtx.device(), depthCI);
 }
 
 void Engine::createHDRImage() {
@@ -433,7 +398,7 @@ bool Engine::initGBufferPass() {
 
     vkDestroyDescriptorSetLayout(device, emptyLayout, nullptr);
 
-    // Build pipeline (2 color attachments + depth, MSAA)
+    // Build pipeline (2 color attachments + depth)
     auto binding = Vertex::bindingDesc();
     auto attrs = Vertex::attributeDescs();
 
@@ -446,11 +411,10 @@ bool Engine::initGBufferPass() {
         .setDepthFormat(VK_FORMAT_D32_SFLOAT)
         .setCullMode(VK_CULL_MODE_BACK_BIT, VK_FRONT_FACE_COUNTER_CLOCKWISE)
         .setDepthTest(true, true, VK_COMPARE_OP_GREATER_OR_EQUAL)
-        .setMultisample(MSAA_SAMPLES)
         .setLayout(m_gbufferPipelineLayout)
         .build(device);
 
-    LOG(Pipeline, Info, "G-Buffer pipeline created (MSAA 4x)");
+    LOG(Pipeline, Info, "G-Buffer pipeline created");
     return true;
 }
 
@@ -769,16 +733,7 @@ void Engine::setupDemoScene() {
 }
 
 void Engine::recordGBufferPass(VkCommandBuffer cmd) {
-    // Transition MSAA images to color/depth attachment
-    Image::transitionLayout(cmd, m_gbufferRT0_MS.handle(),
-        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-    Image::transitionLayout(cmd, m_gbufferRT1_MS.handle(),
-        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-    Image::transitionLayout(cmd, m_depthImage_MS.handle(),
-        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-        VK_IMAGE_ASPECT_DEPTH_BIT);
-
-    // Transition resolve targets to color/depth attachment
+    // Transition G-buffer images to attachment
     Image::transitionLayout(cmd, m_gbufferRT0.handle(),
         VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     Image::transitionLayout(cmd, m_gbufferRT1.handle(),
@@ -789,38 +744,26 @@ void Engine::recordGBufferPass(VkCommandBuffer cmd) {
 
     VkRenderingAttachmentInfo colorAttachments[2]{};
 
-    // RT0: MSAA primary, resolve to single-sample
     colorAttachments[0] = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-    colorAttachments[0].imageView = m_gbufferRT0_MS.view();
+    colorAttachments[0].imageView = m_gbufferRT0.view();
     colorAttachments[0].imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     colorAttachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    colorAttachments[0].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE; // MSAA not needed after resolve
+    colorAttachments[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     colorAttachments[0].clearValue.color = {{0.0f, 0.0f, 0.0f, 0.0f}};
-    colorAttachments[0].resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT;
-    colorAttachments[0].resolveImageView = m_gbufferRT0.view();
-    colorAttachments[0].resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 
-    // RT1: MSAA primary, resolve to single-sample
     colorAttachments[1] = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-    colorAttachments[1].imageView = m_gbufferRT1_MS.view();
+    colorAttachments[1].imageView = m_gbufferRT1.view();
     colorAttachments[1].imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     colorAttachments[1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    colorAttachments[1].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    colorAttachments[1].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     colorAttachments[1].clearValue.color = {{0.5f, 0.5f, 1.0f, 0.0f}};
-    colorAttachments[1].resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT;
-    colorAttachments[1].resolveImageView = m_gbufferRT1.view();
-    colorAttachments[1].resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 
-    // Depth: MSAA primary, resolve to single-sample
     VkRenderingAttachmentInfo depthAttach{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-    depthAttach.imageView = m_depthImage_MS.view();
+    depthAttach.imageView = m_depthImage.view();
     depthAttach.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
     depthAttach.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    depthAttach.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    depthAttach.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     depthAttach.clearValue.depthStencil = {0.0f, 0};
-    depthAttach.resolveMode = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
-    depthAttach.resolveImageView = m_depthImage.view();
-    depthAttach.resolveImageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
     VkRenderingInfo renderInfo{VK_STRUCTURE_TYPE_RENDERING_INFO};
     renderInfo.renderArea = {{0, 0}, m_swapchain.extent()};
@@ -870,7 +813,7 @@ void Engine::recordGBufferPass(VkCommandBuffer cmd) {
 
     vkCmdEndRendering(cmd);
 
-    // Transition resolved images to shader read
+    // Transition G-buffer + depth to shader read
     Image::transitionLayout(cmd, m_gbufferRT0.handle(),
         VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     Image::transitionLayout(cmd, m_gbufferRT1.handle(),
@@ -1134,7 +1077,7 @@ void Engine::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex) {
     VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     VK_CHECK(vkBeginCommandBuffer(cmd, &beginInfo));
 
-    recordGBufferPass(cmd);    // MSAA G-buffer with auto-resolve
+    recordGBufferPass(cmd);    // G-buffer pass
     recordLightingPass(cmd);   // Read G-buffer, output HDR
     recordMotionPass(cmd);     // Read depth, output velocity
     recordTAAPass(cmd);        // Read HDR + velocity + history, output to history
@@ -1250,9 +1193,6 @@ void Engine::handleResize() {
     m_depthImage.shutdown();
     m_gbufferRT0.shutdown();
     m_gbufferRT1.shutdown();
-    m_gbufferRT0_MS.shutdown();
-    m_gbufferRT1_MS.shutdown();
-    m_depthImage_MS.shutdown();
     m_hdrImage.shutdown();
     m_velocityImage.shutdown();
     m_taaHistory[0].shutdown();
@@ -1272,7 +1212,6 @@ void Engine::handleResize() {
     m_depthImage.init(m_vkCtx.allocator(), m_vkCtx.device(), depthCI);
 
     createGBufferImages();
-    createMSAAImages();
     createHDRImage();
     createVelocityImage();
     createTAAImages();
@@ -1360,9 +1299,6 @@ void Engine::shutdown() {
 
     m_gbufferRT0.shutdown();
     m_gbufferRT1.shutdown();
-    m_gbufferRT0_MS.shutdown();
-    m_gbufferRT1_MS.shutdown();
-    m_depthImage_MS.shutdown();
     m_hdrImage.shutdown();
     m_velocityImage.shutdown();
     m_taaHistory[0].shutdown();

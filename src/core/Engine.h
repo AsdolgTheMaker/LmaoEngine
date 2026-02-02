@@ -47,7 +47,6 @@ public:
 private:
     static constexpr uint32_t MAX_SWAPCHAIN_IMAGES = 4;
     static constexpr uint32_t MAX_POINT_LIGHTS = 256;
-    static constexpr VkSampleCountFlagBits MSAA_SAMPLES = VK_SAMPLE_COUNT_4_BIT;
 
     bool initGBufferPass();
     bool initLightingPass();
@@ -66,7 +65,6 @@ private:
     void drawFrame();
     void handleResize();
     void createGBufferImages();
-    void createMSAAImages();
     void createHDRImage();
     void createVelocityImage();
     void createTAAImages();
@@ -84,15 +82,10 @@ private:
 
     std::vector<VkCommandBuffer> m_cmdBuffers;
 
-    // Single-sample images (resolve targets + sampled)
+    // G-buffer images (single-sample)
     Image m_depthImage;
     Image m_gbufferRT0; // RGB = albedo, A = metallic
     Image m_gbufferRT1; // RGB = world normal, A = roughness
-
-    // MSAA images (G-buffer primary attachments)
-    Image m_gbufferRT0_MS;
-    Image m_gbufferRT1_MS;
-    Image m_depthImage_MS;
 
     // HDR target (lighting output)
     Image m_hdrImage;
