@@ -14,7 +14,8 @@ struct MaterialParams {
     vec4 albedoColor{1, 1, 1, 1};
     float metallic = 0.0f;
     float roughness = 0.5f;
-    float _pad[2]{};
+    float normalScale = 1.0f;
+    float _pad{};
 };
 
 class Material {
@@ -25,6 +26,8 @@ public:
     bool init(VulkanContext& ctx, DescriptorManager& descMgr,
               VkDescriptorSetLayout layout,
               std::shared_ptr<Texture> albedoTex,
+              std::shared_ptr<Texture> normalTex,
+              std::shared_ptr<Texture> metalRoughTex,
               const MaterialParams& params = {});
     void shutdown();
 
@@ -33,6 +36,8 @@ public:
 
 private:
     std::shared_ptr<Texture> m_albedoTex;
+    std::shared_ptr<Texture> m_normalTex;
+    std::shared_ptr<Texture> m_metalRoughTex;
     MaterialParams m_params;
     Buffer m_paramsBuffer;
     VkDescriptorSet m_descriptorSet = VK_NULL_HANDLE;

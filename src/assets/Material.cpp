@@ -9,8 +9,12 @@ namespace lmao {
 bool Material::init(VulkanContext& ctx, DescriptorManager& descMgr,
                     VkDescriptorSetLayout layout,
                     std::shared_ptr<Texture> albedoTex,
+                    std::shared_ptr<Texture> normalTex,
+                    std::shared_ptr<Texture> metalRoughTex,
                     const MaterialParams& params) {
     m_albedoTex = std::move(albedoTex);
+    m_normalTex = std::move(normalTex);
+    m_metalRoughTex = std::move(metalRoughTex);
     m_params = params;
 
     // Create params UBO
@@ -27,19 +31,29 @@ bool Material::init(VulkanContext& ctx, DescriptorManager& descMgr,
     DescriptorManager::writeImage(ctx.device(), m_descriptorSet, 0,
         m_albedoTex->imageView(), m_albedoTex->sampler());
 
-    // Write params UBO (binding 1)
-    DescriptorManager::writeBuffer(ctx.device(), m_descriptorSet, 1,
+    // Write normal map (binding 1)
+    DescriptorManager::writeImage(ctx.device(), m_descriptorSet, 1,
+        m_normalTex->imageView(), m_normalTex->sampler());
+
+    // Write metallic-roughness map (binding 2)
+    DescriptorManager::writeImage(ctx.device(), m_descriptorSet, 2,
+        m_metalRoughTex->imageView(), m_metalRoughTex->sampler());
+
+    // Write params UBO (binding 3)
+    DescriptorManager::writeBuffer(ctx.device(), m_descriptorSet, 3,
         m_paramsBuffer.handle(), sizeof(MaterialParams));
 
-    LOG(Assets, Debug, "Material created: albedo=(%.2f,%.2f,%.2f) metallic=%.2f roughness=%.2f",
+    LOG(Assets, Debug, "Material created: albedo=(%.2f,%.2f,%.2f) metallic=%.2f roughness=%.2f normalScale=%.2f",
         params.albedoColor.r, params.albedoColor.g, params.albedoColor.b,
-        params.metallic, params.roughness);
+        params.metallic, params.roughness, params.normalScale);
     return true;
 }
 
 void Material::shutdown() {
     m_paramsBuffer.shutdown();
     m_albedoTex.reset();
+    m_normalTex.reset();
+    m_metalRoughTex.reset();
     m_descriptorSet = VK_NULL_HANDLE;
 }
 

@@ -9,4 +9,10 @@ Entity& Scene::createEntity(const std::string& name) {
     return m_entities.back();
 }
 
+PointLight& Scene::createPointLight() {
+    m_pointLights.emplace_back();
+    LOG(Scene, Debug, "Point light created (total: %zu)", m_pointLights.size());
+    return m_pointLights.back();
+}
+
 } // namespace lmao

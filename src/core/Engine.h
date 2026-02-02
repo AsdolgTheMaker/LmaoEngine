@@ -21,6 +21,20 @@ class Mesh;
 class Texture;
 class Material;
 
+struct GPUPointLight {
+    vec4 positionAndRange;   // xyz = position, w = range
+    vec4 colorAndIntensity;  // xyz = color, w = intensity
+};
+
+enum class DebugMode : uint32_t {
+    Final = 0,
+    Albedo = 1,
+    Metallic = 2,
+    Roughness = 3,
+    Normals = 4,
+    Depth = 5,
+};
+
 class Engine {
 public:
     Engine() = default;
@@ -31,11 +45,22 @@ public:
     void shutdown();
 
 private:
-    bool initForwardPass();
+    static constexpr uint32_t MAX_SWAPCHAIN_IMAGES = 4;
+    static constexpr uint32_t MAX_POINT_LIGHTS = 256;
+
+    bool initGBufferPass();
+    bool initLightingPass();
+    bool initTonemapPass();
     void setupDemoScene();
     void recordCommands(VkCommandBuffer cmd, uint32_t imageIndex);
+    void recordGBufferPass(VkCommandBuffer cmd);
+    void recordLightingPass(VkCommandBuffer cmd);
+    void recordTonemapPass(VkCommandBuffer cmd, uint32_t imageIndex);
     void drawFrame();
     void handleResize();
+    void createGBufferImages();
+    void createHDRImage();
+    void updateLightingDescriptors();
 
     Window m_window;
     Timer m_timer;
@@ -51,15 +76,42 @@ private:
     // Scene
     Scene m_scene;
 
-    // Forward rendering
-    VkPipelineLayout m_forwardPipelineLayout = VK_NULL_HANDLE;
-    VkPipeline m_forwardPipeline = VK_NULL_HANDLE;
-    ShaderModule m_forwardVert;
-    ShaderModule m_forwardFrag;
+    // G-Buffer images
+    Image m_gbufferRT0; // RGB = albedo, A = metallic
+    Image m_gbufferRT1; // RGB = world normal, A = roughness
+
+    // HDR target
+    Image m_hdrImage;
+
+    // G-Buffer pass
+    VkPipelineLayout m_gbufferPipelineLayout = VK_NULL_HANDLE;
+    VkPipeline m_gbufferPipeline = VK_NULL_HANDLE;
+    ShaderModule m_gbufferVert;
+    ShaderModule m_gbufferFrag;
     VkDescriptorSetLayout m_materialSetLayout = VK_NULL_HANDLE;
 
+    // Lighting pass
+    VkPipelineLayout m_lightingPipelineLayout = VK_NULL_HANDLE;
+    VkPipeline m_lightingPipeline = VK_NULL_HANDLE;
+    ShaderModule m_fullscreenVert;
+    ShaderModule m_lightingFrag;
+    VkDescriptorSetLayout m_lightingSetLayout = VK_NULL_HANDLE;
+    VkDescriptorSet m_lightingSets[MAX_SWAPCHAIN_IMAGES]{};
+
+    // Tonemap pass
+    VkPipelineLayout m_tonemapPipelineLayout = VK_NULL_HANDLE;
+    VkPipeline m_tonemapPipeline = VK_NULL_HANDLE;
+    ShaderModule m_tonemapFrag;
+    VkDescriptorSetLayout m_tonemapSetLayout = VK_NULL_HANDLE;
+    VkDescriptorSet m_tonemapSet = VK_NULL_HANDLE;
+
+    // G-Buffer sampler (nearest, clamp-to-edge)
+    VkSampler m_gbufferSampler = VK_NULL_HANDLE;
+
+    // Point lights SSBO
+    Buffer m_pointLightBuffers[MAX_SWAPCHAIN_IMAGES];
+
     // Global UBO
-    static constexpr uint32_t MAX_SWAPCHAIN_IMAGES = 4;
     Buffer m_uniformBuffers[MAX_SWAPCHAIN_IMAGES];
     VkDescriptorSetLayout m_globalSetLayout = VK_NULL_HANDLE;
     VkDescriptorSet m_globalSets[MAX_SWAPCHAIN_IMAGES]{};
@@ -68,12 +120,17 @@ private:
         mat4 view;
         mat4 proj;
         mat4 viewProj;
+        mat4 invViewProj;
         vec4 cameraPos;
         float time;
-        float _pad0[3];
+        uint32_t pointLightCount;
+        float _pad0[2];
         vec4 dirLightDir;   // xyz = direction, w unused
         vec4 dirLightColor; // xyz = color, w = intensity
     };
+
+    // Debug
+    DebugMode m_debugMode = DebugMode::Final;
 
     // Asset caches
     std::vector<std::shared_ptr<Mesh>> m_meshes;
