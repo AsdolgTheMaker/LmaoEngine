@@ -29,6 +29,10 @@ public:
     vec3 up() const;
     mat4 viewMatrix() const;
     mat4 projectionMatrix() const { return m_projection; }
+    float fovY() const { return m_fovY; }
+    float aspect() const { return m_aspect; }
+    float nearPlane() const { return m_near; }
+    float farPlane() const { return m_far; }
 
     float moveSpeed = 5.0f;
     float lookSensitivity = 0.002f;

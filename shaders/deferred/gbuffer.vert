@@ -14,6 +14,8 @@ layout(set = 0, binding = 0) uniform GlobalUBO {
     vec4 dirLightDir;
     vec4 dirLightColor;
     vec4 resolution;
+    mat4 cascadeViewProj[3];
+    vec4 cascadeSplits;
 };
 
 layout(push_constant) uniform PushConstants {

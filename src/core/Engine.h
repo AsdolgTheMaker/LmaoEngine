@@ -33,6 +33,7 @@ enum class DebugMode : uint32_t {
     Roughness = 3,
     Normals = 4,
     Depth = 5,
+    Cascades = 7,
 };
 
 class Engine {
@@ -47,7 +48,11 @@ public:
 private:
     static constexpr uint32_t MAX_SWAPCHAIN_IMAGES = 4;
     static constexpr uint32_t MAX_POINT_LIGHTS = 256;
+    static constexpr uint32_t SHADOW_MAP_SIZE = 4096;
+    static constexpr uint32_t SHADOW_CASCADE_COUNT = 3;
+    static constexpr float SHADOW_DISTANCE = 100.0f;
 
+    bool initShadowPass();
     bool initGBufferPass();
     bool initLightingPass();
     bool initMotionPass();
@@ -56,6 +61,7 @@ private:
     bool initFXAAPass();
     void setupDemoScene();
     void recordCommands(VkCommandBuffer cmd, uint32_t imageIndex);
+    void recordShadowPass(VkCommandBuffer cmd);
     void recordGBufferPass(VkCommandBuffer cmd);
     void recordLightingPass(VkCommandBuffer cmd);
     void recordMotionPass(VkCommandBuffer cmd);
@@ -69,6 +75,8 @@ private:
     void createVelocityImage();
     void createTAAImages();
     void createLDRImage();
+    void createShadowMap();
+    void computeCascades(mat4 cascadeVP[SHADOW_CASCADE_COUNT], vec4& splits);
     void updateLightingDescriptors();
     void updateAADescriptors();
 
@@ -101,8 +109,17 @@ private:
     // LDR intermediate (tonemap output, FXAA input)
     Image m_ldrImage;
 
+    // Shadow map (D32_SFLOAT 2D array, 3 cascades)
+    Image m_shadowMap;
+    VkImageView m_shadowLayerViews[SHADOW_CASCADE_COUNT]{};
+
     // Scene
     Scene m_scene;
+
+    // Shadow pass
+    VkPipelineLayout m_shadowPipelineLayout = VK_NULL_HANDLE;
+    VkPipeline m_shadowPipeline = VK_NULL_HANDLE;
+    ShaderModule m_shadowVert;
 
     // G-Buffer pass
     VkPipelineLayout m_gbufferPipelineLayout = VK_NULL_HANDLE;
@@ -146,6 +163,7 @@ private:
     // Samplers
     VkSampler m_nearestSampler = VK_NULL_HANDLE; // nearest, clamp-to-edge
     VkSampler m_linearSampler = VK_NULL_HANDLE;  // linear, clamp-to-edge
+    VkSampler m_shadowSampler = VK_NULL_HANDLE;  // comparison sampler for shadow maps
 
     // Point lights SSBO
     Buffer m_pointLightBuffers[MAX_SWAPCHAIN_IMAGES];
@@ -169,10 +187,15 @@ private:
         vec4 dirLightDir;     // xyz = direction, w unused
         vec4 dirLightColor;   // xyz = color, w = intensity
         vec4 resolution;      // xy = width/height, zw = 1/width, 1/height
+        mat4 cascadeViewProj[3];
+        vec4 cascadeSplits;   // xyz = split depths (view-space), w = shadow bias
     };
 
     // Previous frame state for TAA
     mat4 m_prevViewProj{1.0f};
+
+    // Cascade shadow map VP matrices (computed per frame, used by recordShadowPass)
+    mat4 m_cascadeVP[SHADOW_CASCADE_COUNT];
 
     // Debug
     DebugMode m_debugMode = DebugMode::Final;

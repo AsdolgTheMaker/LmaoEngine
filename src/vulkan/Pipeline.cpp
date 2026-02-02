@@ -74,6 +74,13 @@ PipelineBuilder& PipelineBuilder::setDepthTest(bool enable, bool write, VkCompar
     return *this;
 }
 
+PipelineBuilder& PipelineBuilder::setDepthBias(bool enable, float constantFactor, float slopeFactor) {
+    m_rasterization.depthBiasEnable = enable ? VK_TRUE : VK_FALSE;
+    m_rasterization.depthBiasConstantFactor = constantFactor;
+    m_rasterization.depthBiasSlopeFactor = slopeFactor;
+    return *this;
+}
+
 PipelineBuilder& PipelineBuilder::setColorBlendAttachment(uint32_t count, bool blendEnable) {
     m_blendAttachments.clear();
     for (uint32_t i = 0; i < count; i++) {
