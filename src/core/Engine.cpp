@@ -206,7 +206,7 @@ bool Engine::init() {
     }
 
     // Global UBO + point light SSBO descriptor set layout
-    VkDescriptorSetLayoutBinding globalBindings[6] = {
+    VkDescriptorSetLayoutBinding globalBindings[9] = {
         {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1,
          VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
         {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
@@ -219,8 +219,14 @@ bool Engine::init() {
          VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
         {5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
          VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+        {6, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
+         VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+        {7, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
+         VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+        {8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
+         VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
     };
-    m_globalSetLayout = m_descriptors.getOrCreateLayout(globalBindings, 6);
+    m_globalSetLayout = m_descriptors.getOrCreateLayout(globalBindings, 9);
 
     for (uint32_t i = 0; i < m_swapchain.imageCount(); i++) {
         m_uniformBuffers[i].init(m_vkCtx.allocator(), sizeof(GlobalUBO),
@@ -248,7 +254,9 @@ bool Engine::init() {
 
     if (!initShadowPass()) return false;
     if (!initGBufferPass()) return false;
+    initIBL();
     if (!initLightingPass()) return false;
+    if (!initSkyboxPass()) return false;
     if (!initMotionPass()) return false;
     if (!initTAAPass()) return false;
     if (!initTonemapPass()) return false;
@@ -454,6 +462,14 @@ void Engine::updateLightingDescriptors() {
             m_depthImage.view(), m_nearestSampler);
         DescriptorManager::writeImage(m_vkCtx.device(), m_globalSets[i], 5,
             m_shadowMap.view(), m_shadowSampler);
+        if (m_irradianceMap.handle()) {
+            DescriptorManager::writeImage(m_vkCtx.device(), m_globalSets[i], 6,
+                m_irradianceMap.view(), m_cubemapSampler);
+            DescriptorManager::writeImage(m_vkCtx.device(), m_globalSets[i], 7,
+                m_prefilteredMap.view(), m_cubemapSampler);
+            DescriptorManager::writeImage(m_vkCtx.device(), m_globalSets[i], 8,
+                m_brdfLUT.view(), m_linearSampler);
+        }
     }
 }
 
@@ -589,6 +605,362 @@ bool Engine::initGBufferPass() {
         .build(device);
 
     LOG(Pipeline, Info, "G-Buffer pipeline created");
+    return true;
+}
+
+void Engine::initIBL() {
+    VkDevice device = m_vkCtx.device();
+
+    // Cubemap sampler (linear, mipmap linear, clamp-to-edge)
+    {
+        VkSamplerCreateInfo sampCI{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        sampCI.magFilter = VK_FILTER_LINEAR;
+        sampCI.minFilter = VK_FILTER_LINEAR;
+        sampCI.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+        sampCI.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        sampCI.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        sampCI.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        sampCI.maxLod = 4.0f;
+        VK_CHECK(vkCreateSampler(device, &sampCI, nullptr, &m_cubemapSampler));
+    }
+
+    // BRDF LUT (512x512, RG16F)
+    {
+        Image::CreateInfo ci{};
+        ci.width = 512;
+        ci.height = 512;
+        ci.format = VK_FORMAT_R16G16_SFLOAT;
+        ci.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        m_brdfLUT.init(m_vkCtx.allocator(), device, ci);
+    }
+
+    // Environment cubemap (512x512x6, RGBA16F)
+    {
+        Image::CreateInfo ci{};
+        ci.width = 512;
+        ci.height = 512;
+        ci.arrayLayers = 6;
+        ci.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+        ci.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        ci.viewType = VK_IMAGE_VIEW_TYPE_CUBE;
+        m_envCubemap.init(m_vkCtx.allocator(), device, ci);
+    }
+
+    // Irradiance cubemap (32x32x6, RGBA16F)
+    {
+        Image::CreateInfo ci{};
+        ci.width = 32;
+        ci.height = 32;
+        ci.arrayLayers = 6;
+        ci.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+        ci.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        ci.viewType = VK_IMAGE_VIEW_TYPE_CUBE;
+        m_irradianceMap.init(m_vkCtx.allocator(), device, ci);
+    }
+
+    // Pre-filtered environment cubemap (512x512x6, RGBA16F, 5 mips)
+    {
+        Image::CreateInfo ci{};
+        ci.width = 512;
+        ci.height = 512;
+        ci.arrayLayers = 6;
+        ci.mipLevels = 5;
+        ci.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+        ci.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        ci.viewType = VK_IMAGE_VIEW_TYPE_CUBE;
+        m_prefilteredMap.init(m_vkCtx.allocator(), device, ci);
+    }
+
+    // === Generate BRDF LUT ===
+    {
+        VkDescriptorSetLayoutBinding binding{};
+        binding.binding = 0;
+        binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        binding.descriptorCount = 1;
+        binding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+        ShaderModule shader;
+        shader.loadFromFile(device, "shaders/ibl/brdf_lut.comp.spv");
+
+        VkDescriptorSetLayout setLayout = m_descriptors.getOrCreateLayout(&binding, 1);
+        VkDescriptorSet descSet = m_descriptors.allocate(setLayout);
+
+        VkPipelineLayoutCreateInfo layoutCI{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        layoutCI.setLayoutCount = 1;
+        layoutCI.pSetLayouts = &setLayout;
+
+        VkPipelineLayout pipeLayout;
+        VK_CHECK(vkCreatePipelineLayout(device, &layoutCI, nullptr, &pipeLayout));
+
+        VkComputePipelineCreateInfo pipeCI{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        pipeCI.stage = shader.stageInfo(VK_SHADER_STAGE_COMPUTE_BIT);
+        pipeCI.layout = pipeLayout;
+
+        VkPipeline pipeline;
+        VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeCI, nullptr, &pipeline));
+
+        DescriptorManager::writeStorageImage(device, descSet, 0, m_brdfLUT.view());
+
+        m_cmdPool.submitImmediate(m_vkCtx.graphicsQueue(), [&](VkCommandBuffer cmd) {
+            Image::transitionLayout(cmd, m_brdfLUT.handle(),
+                VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                pipeLayout, 0, 1, &descSet, 0, nullptr);
+            vkCmdDispatch(cmd, 512 / 16, 512 / 16, 1);
+
+            Image::transitionLayout(cmd, m_brdfLUT.handle(),
+                VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        });
+
+        vkDestroyPipeline(device, pipeline, nullptr);
+        vkDestroyPipelineLayout(device, pipeLayout, nullptr);
+        shader.shutdown();
+    }
+    LOG(Core, Info, "BRDF LUT generated");
+
+    // === Generate procedural sky cubemap ===
+    {
+        VkDescriptorSetLayoutBinding binding{};
+        binding.binding = 0;
+        binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        binding.descriptorCount = 1;
+        binding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+        ShaderModule shader;
+        shader.loadFromFile(device, "shaders/ibl/sky_cubemap.comp.spv");
+
+        VkDescriptorSetLayout setLayout = m_descriptors.getOrCreateLayout(&binding, 1);
+        VkDescriptorSet descSet = m_descriptors.allocate(setLayout);
+
+        VkPipelineLayoutCreateInfo layoutCI{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        layoutCI.setLayoutCount = 1;
+        layoutCI.pSetLayouts = &setLayout;
+
+        VkPipelineLayout pipeLayout;
+        VK_CHECK(vkCreatePipelineLayout(device, &layoutCI, nullptr, &pipeLayout));
+
+        VkComputePipelineCreateInfo pipeCI{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        pipeCI.stage = shader.stageInfo(VK_SHADER_STAGE_COMPUTE_BIT);
+        pipeCI.layout = pipeLayout;
+
+        VkPipeline pipeline;
+        VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeCI, nullptr, &pipeline));
+
+        DescriptorManager::writeStorageImage(device, descSet, 0, m_envCubemap.view());
+
+        m_cmdPool.submitImmediate(m_vkCtx.graphicsQueue(), [&](VkCommandBuffer cmd) {
+            Image::transitionLayout(cmd, m_envCubemap.handle(),
+                VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                VK_IMAGE_ASPECT_COLOR_BIT, 1, 6);
+
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                pipeLayout, 0, 1, &descSet, 0, nullptr);
+            vkCmdDispatch(cmd, 512 / 16, 512 / 16, 6);
+
+            Image::transitionLayout(cmd, m_envCubemap.handle(),
+                VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_IMAGE_ASPECT_COLOR_BIT, 1, 6);
+        });
+
+        vkDestroyPipeline(device, pipeline, nullptr);
+        vkDestroyPipelineLayout(device, pipeLayout, nullptr);
+        shader.shutdown();
+    }
+    LOG(Core, Info, "Sky cubemap generated");
+
+    // === Generate irradiance cubemap ===
+    {
+        VkDescriptorSetLayoutBinding bindings[2]{};
+        bindings[0].binding = 0;
+        bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        bindings[0].descriptorCount = 1;
+        bindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        bindings[1].binding = 1;
+        bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        bindings[1].descriptorCount = 1;
+        bindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+        ShaderModule shader;
+        shader.loadFromFile(device, "shaders/ibl/irradiance.comp.spv");
+
+        VkDescriptorSetLayout setLayout = m_descriptors.getOrCreateLayout(bindings, 2);
+        VkDescriptorSet descSet = m_descriptors.allocate(setLayout);
+
+        VkPipelineLayoutCreateInfo layoutCI{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        layoutCI.setLayoutCount = 1;
+        layoutCI.pSetLayouts = &setLayout;
+
+        VkPipelineLayout pipeLayout;
+        VK_CHECK(vkCreatePipelineLayout(device, &layoutCI, nullptr, &pipeLayout));
+
+        VkComputePipelineCreateInfo pipeCI{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        pipeCI.stage = shader.stageInfo(VK_SHADER_STAGE_COMPUTE_BIT);
+        pipeCI.layout = pipeLayout;
+
+        VkPipeline pipeline;
+        VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeCI, nullptr, &pipeline));
+
+        DescriptorManager::writeImage(device, descSet, 0, m_envCubemap.view(), m_cubemapSampler);
+        DescriptorManager::writeStorageImage(device, descSet, 1, m_irradianceMap.view());
+
+        m_cmdPool.submitImmediate(m_vkCtx.graphicsQueue(), [&](VkCommandBuffer cmd) {
+            Image::transitionLayout(cmd, m_irradianceMap.handle(),
+                VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                VK_IMAGE_ASPECT_COLOR_BIT, 1, 6);
+
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                pipeLayout, 0, 1, &descSet, 0, nullptr);
+            vkCmdDispatch(cmd, 32 / 16, 32 / 16, 6);
+
+            Image::transitionLayout(cmd, m_irradianceMap.handle(),
+                VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_IMAGE_ASPECT_COLOR_BIT, 1, 6);
+        });
+
+        vkDestroyPipeline(device, pipeline, nullptr);
+        vkDestroyPipelineLayout(device, pipeLayout, nullptr);
+        shader.shutdown();
+    }
+    LOG(Core, Info, "Irradiance cubemap generated");
+
+    // === Generate pre-filtered environment map (5 mip levels) ===
+    {
+        VkDescriptorSetLayoutBinding bindings[2]{};
+        bindings[0].binding = 0;
+        bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        bindings[0].descriptorCount = 1;
+        bindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        bindings[1].binding = 1;
+        bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        bindings[1].descriptorCount = 1;
+        bindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+        ShaderModule shader;
+        shader.loadFromFile(device, "shaders/ibl/prefilter.comp.spv");
+
+        VkDescriptorSetLayout setLayout = m_descriptors.getOrCreateLayout(bindings, 2);
+
+        VkPushConstantRange pushRange{};
+        pushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        pushRange.size = sizeof(float) + sizeof(uint32_t);
+
+        VkPipelineLayoutCreateInfo layoutCI{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        layoutCI.setLayoutCount = 1;
+        layoutCI.pSetLayouts = &setLayout;
+        layoutCI.pushConstantRangeCount = 1;
+        layoutCI.pPushConstantRanges = &pushRange;
+
+        VkPipelineLayout pipeLayout;
+        VK_CHECK(vkCreatePipelineLayout(device, &layoutCI, nullptr, &pipeLayout));
+
+        VkComputePipelineCreateInfo pipeCI{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        pipeCI.stage = shader.stageInfo(VK_SHADER_STAGE_COMPUTE_BIT);
+        pipeCI.layout = pipeLayout;
+
+        VkPipeline pipeline;
+        VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeCI, nullptr, &pipeline));
+
+        // Transition all mips to GENERAL
+        m_cmdPool.submitImmediate(m_vkCtx.graphicsQueue(), [&](VkCommandBuffer cmd) {
+            Image::transitionLayout(cmd, m_prefilteredMap.handle(),
+                VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                VK_IMAGE_ASPECT_COLOR_BIT, 5, 6);
+        });
+
+        // Dispatch per mip level with per-mip views
+        constexpr uint32_t maxMips = 5;
+        for (uint32_t mip = 0; mip < maxMips; mip++) {
+            uint32_t mipSize = 512 >> mip;
+            float roughness = static_cast<float>(mip) / static_cast<float>(maxMips - 1);
+
+            // Per-mip cubemap view for imageStore
+            VkImageViewCreateInfo viewCI{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+            viewCI.image = m_prefilteredMap.handle();
+            viewCI.viewType = VK_IMAGE_VIEW_TYPE_CUBE;
+            viewCI.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+            viewCI.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            viewCI.subresourceRange.baseMipLevel = mip;
+            viewCI.subresourceRange.levelCount = 1;
+            viewCI.subresourceRange.baseArrayLayer = 0;
+            viewCI.subresourceRange.layerCount = 6;
+
+            VkImageView mipView;
+            VK_CHECK(vkCreateImageView(device, &viewCI, nullptr, &mipView));
+
+            VkDescriptorSet descSet = m_descriptors.allocate(setLayout);
+            DescriptorManager::writeImage(device, descSet, 0, m_envCubemap.view(), m_cubemapSampler);
+            DescriptorManager::writeStorageImage(device, descSet, 1, mipView);
+
+            struct { float roughness; uint32_t mipSize; } pc = {roughness, mipSize};
+
+            m_cmdPool.submitImmediate(m_vkCtx.graphicsQueue(), [&](VkCommandBuffer cmd) {
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                    pipeLayout, 0, 1, &descSet, 0, nullptr);
+                vkCmdPushConstants(cmd, pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+                vkCmdDispatch(cmd, (mipSize + 15) / 16, (mipSize + 15) / 16, 6);
+            });
+
+            vkDestroyImageView(device, mipView, nullptr);
+        }
+
+        // Transition all mips to shader read
+        m_cmdPool.submitImmediate(m_vkCtx.graphicsQueue(), [&](VkCommandBuffer cmd) {
+            Image::transitionLayout(cmd, m_prefilteredMap.handle(),
+                VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_IMAGE_ASPECT_COLOR_BIT, 5, 6);
+        });
+
+        vkDestroyPipeline(device, pipeline, nullptr);
+        vkDestroyPipelineLayout(device, pipeLayout, nullptr);
+        shader.shutdown();
+    }
+    LOG(Core, Info, "Pre-filtered env map generated");
+
+    // Update lighting descriptors with IBL textures (bindings 6-8)
+    updateLightingDescriptors();
+    LOG(Core, Info, "IBL resources initialized");
+}
+
+bool Engine::initSkyboxPass() {
+    VkDevice device = m_vkCtx.device();
+
+    if (!m_skyboxVert.loadFromFile(device, "shaders/deferred/skybox.vert.spv")) return false;
+    if (!m_skyboxFrag.loadFromFile(device, "shaders/deferred/skybox.frag.spv")) return false;
+
+    // Skybox descriptor set layout (set 1): env cubemap
+    VkDescriptorSetLayoutBinding skyboxBinding{};
+    skyboxBinding.binding = 0;
+    skyboxBinding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    skyboxBinding.descriptorCount = 1;
+    skyboxBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+    m_skyboxSetLayout = m_descriptors.getOrCreateLayout(&skyboxBinding, 1);
+    m_skyboxSet = m_descriptors.allocate(m_skyboxSetLayout);
+    DescriptorManager::writeImage(device, m_skyboxSet, 0, m_envCubemap.view(), m_cubemapSampler);
+
+    // Pipeline layout: set 0 = global, set 1 = skybox cubemap
+    VkDescriptorSetLayout setLayouts[] = {m_globalSetLayout, m_skyboxSetLayout};
+
+    VkPipelineLayoutCreateInfo layoutCI{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    layoutCI.setLayoutCount = 2;
+    layoutCI.pSetLayouts = setLayouts;
+    VK_CHECK(vkCreatePipelineLayout(device, &layoutCI, nullptr, &m_skyboxPipelineLayout));
+
+    m_skyboxPipeline = PipelineBuilder()
+        .addShaderStage(m_skyboxVert.stageInfo(VK_SHADER_STAGE_VERTEX_BIT))
+        .addShaderStage(m_skyboxFrag.stageInfo(VK_SHADER_STAGE_FRAGMENT_BIT))
+        .setColorFormats({VK_FORMAT_R16G16B16A16_SFLOAT})
+        .setDepthTest(false, false)
+        .setCullMode(VK_CULL_MODE_NONE)
+        .setLayout(m_skyboxPipelineLayout)
+        .build(device);
+
+    LOG(Pipeline, Info, "Skybox pipeline created");
     return true;
 }
 
@@ -1102,6 +1474,49 @@ void Engine::recordLightingPass(VkCommandBuffer cmd) {
 
     vkCmdEndRendering(cmd);
 
+    // HDR stays in COLOR_ATTACHMENT_OPTIMAL for skybox pass
+}
+
+void Engine::recordSkyboxPass(VkCommandBuffer cmd) {
+    // HDR is still in COLOR_ATTACHMENT_OPTIMAL from lighting pass
+    VkRenderingAttachmentInfo colorAttach{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    colorAttach.imageView = m_hdrImage.view();
+    colorAttach.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    colorAttach.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    colorAttach.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+
+    VkRenderingInfo renderInfo{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    renderInfo.renderArea = {{0, 0}, m_swapchain.extent()};
+    renderInfo.layerCount = 1;
+    renderInfo.colorAttachmentCount = 1;
+    renderInfo.pColorAttachments = &colorAttach;
+
+    vkCmdBeginRendering(cmd, &renderInfo);
+
+    VkViewport viewport{};
+    viewport.x = 0;
+    viewport.y = 0;
+    viewport.width = static_cast<float>(m_swapchain.extent().width);
+    viewport.height = static_cast<float>(m_swapchain.extent().height);
+    viewport.minDepth = 0.0f;
+    viewport.maxDepth = 1.0f;
+    vkCmdSetViewport(cmd, 0, 1, &viewport);
+
+    VkRect2D scissor{{0, 0}, m_swapchain.extent()};
+    vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_skyboxPipeline);
+
+    uint32_t frame = m_frameSync.currentFrame();
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+        m_skyboxPipelineLayout, 0, 1, &m_globalSets[frame], 0, nullptr);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+        m_skyboxPipelineLayout, 1, 1, &m_skyboxSet, 0, nullptr);
+
+    vkCmdDraw(cmd, 3, 1, 0, 0);
+
+    vkCmdEndRendering(cmd);
+
     // Transition HDR to shader read for TAA
     Image::transitionLayout(cmd, m_hdrImage.handle(),
         VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
@@ -1314,6 +1729,7 @@ void Engine::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex) {
     recordShadowPass(cmd);     // Depth-only per cascade
     recordGBufferPass(cmd);    // G-buffer pass
     recordLightingPass(cmd);   // Read G-buffer + shadow map, output HDR
+    recordSkyboxPass(cmd);     // Render sky into HDR for far-plane pixels
     recordMotionPass(cmd);     // Read depth, output velocity
     recordTAAPass(cmd);        // Read HDR + velocity + history, output to history
     recordTonemapPass(cmd);    // Read TAA output, output LDR
@@ -1378,6 +1794,7 @@ void Engine::drawFrame() {
         ubo.cascadeViewProj[i] = m_cascadeVP[i];
     }
     ubo.cascadeSplits = cascadeSplits;
+    ubo.iblIntensity = 1.0f;
 
     m_uniformBuffers[frame].upload(&ubo, sizeof(ubo));
 
@@ -1513,6 +1930,8 @@ void Engine::shutdown() {
     m_meshes.clear();
 
     // Destroy pipelines
+    if (m_skyboxPipeline) vkDestroyPipeline(device, m_skyboxPipeline, nullptr);
+    if (m_skyboxPipelineLayout) vkDestroyPipelineLayout(device, m_skyboxPipelineLayout, nullptr);
     if (m_shadowPipeline) vkDestroyPipeline(device, m_shadowPipeline, nullptr);
     if (m_shadowPipelineLayout) vkDestroyPipelineLayout(device, m_shadowPipelineLayout, nullptr);
     if (m_gbufferPipeline) vkDestroyPipeline(device, m_gbufferPipeline, nullptr);
@@ -1528,6 +1947,8 @@ void Engine::shutdown() {
     if (m_fxaaPipeline) vkDestroyPipeline(device, m_fxaaPipeline, nullptr);
     if (m_fxaaPipelineLayout) vkDestroyPipelineLayout(device, m_fxaaPipelineLayout, nullptr);
 
+    m_skyboxVert.shutdown();
+    m_skyboxFrag.shutdown();
     m_shadowVert.shutdown();
     m_gbufferVert.shutdown();
     m_gbufferFrag.shutdown();
@@ -1541,12 +1962,18 @@ void Engine::shutdown() {
     if (m_nearestSampler) vkDestroySampler(device, m_nearestSampler, nullptr);
     if (m_linearSampler) vkDestroySampler(device, m_linearSampler, nullptr);
     if (m_shadowSampler) vkDestroySampler(device, m_shadowSampler, nullptr);
+    if (m_cubemapSampler) vkDestroySampler(device, m_cubemapSampler, nullptr);
 
     for (auto& v : m_shadowLayerViews) {
         if (v) vkDestroyImageView(device, v, nullptr);
         v = VK_NULL_HANDLE;
     }
     m_shadowMap.shutdown();
+
+    m_envCubemap.shutdown();
+    m_irradianceMap.shutdown();
+    m_prefilteredMap.shutdown();
+    m_brdfLUT.shutdown();
 
     for (auto& ub : m_uniformBuffers) ub.shutdown();
     for (auto& plb : m_pointLightBuffers) plb.shutdown();

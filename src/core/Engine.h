@@ -54,7 +54,9 @@ private:
 
     bool initShadowPass();
     bool initGBufferPass();
+    void initIBL();
     bool initLightingPass();
+    bool initSkyboxPass();
     bool initMotionPass();
     bool initTAAPass();
     bool initTonemapPass();
@@ -64,6 +66,7 @@ private:
     void recordShadowPass(VkCommandBuffer cmd);
     void recordGBufferPass(VkCommandBuffer cmd);
     void recordLightingPass(VkCommandBuffer cmd);
+    void recordSkyboxPass(VkCommandBuffer cmd);
     void recordMotionPass(VkCommandBuffer cmd);
     void recordTAAPass(VkCommandBuffer cmd);
     void recordTonemapPass(VkCommandBuffer cmd);
@@ -113,6 +116,13 @@ private:
     Image m_shadowMap;
     VkImageView m_shadowLayerViews[SHADOW_CASCADE_COUNT]{};
 
+    // IBL resources
+    Image m_envCubemap;        // 512x512 sky cubemap
+    Image m_irradianceMap;     // 32x32 irradiance cubemap
+    Image m_prefilteredMap;    // 512x512 pre-filtered env, 5 mips
+    Image m_brdfLUT;           // 512x512 BRDF integration LUT
+    VkSampler m_cubemapSampler = VK_NULL_HANDLE;
+
     // Scene
     Scene m_scene;
 
@@ -120,6 +130,14 @@ private:
     VkPipelineLayout m_shadowPipelineLayout = VK_NULL_HANDLE;
     VkPipeline m_shadowPipeline = VK_NULL_HANDLE;
     ShaderModule m_shadowVert;
+
+    // Skybox pass
+    VkPipelineLayout m_skyboxPipelineLayout = VK_NULL_HANDLE;
+    VkPipeline m_skyboxPipeline = VK_NULL_HANDLE;
+    ShaderModule m_skyboxVert;
+    ShaderModule m_skyboxFrag;
+    VkDescriptorSetLayout m_skyboxSetLayout = VK_NULL_HANDLE;
+    VkDescriptorSet m_skyboxSet = VK_NULL_HANDLE;
 
     // G-Buffer pass
     VkPipelineLayout m_gbufferPipelineLayout = VK_NULL_HANDLE;
@@ -189,6 +207,8 @@ private:
         vec4 resolution;      // xy = width/height, zw = 1/width, 1/height
         mat4 cascadeViewProj[3];
         vec4 cascadeSplits;   // xyz = split depths (view-space), w = shadow bias
+        float iblIntensity;
+        float _pad6[3];
     };
 
     // Previous frame state for TAA

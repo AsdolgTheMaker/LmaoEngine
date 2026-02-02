@@ -16,6 +16,7 @@ layout(set = 0, binding = 0) uniform GlobalUBO {
     vec4 resolution;
     mat4 cascadeViewProj[3];
     vec4 cascadeSplits;
+    float iblIntensity;
 };
 
 layout(push_constant) uniform PushConstants {

@@ -1,0 +1,77 @@
+#version 460
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0, rgba16f) uniform writeonly imageCube envMap;
+
+const float PI = 3.14159265359;
+
+// Convert cubemap face + UV to world direction
+vec3 cubeDir(int face, vec2 uv) {
+    // Map [0,1] to [-1,1]
+    vec2 st = uv * 2.0 - 1.0;
+    switch (face) {
+        case 0: return normalize(vec3( 1.0, -st.y, -st.x)); // +X
+        case 1: return normalize(vec3(-1.0, -st.y,  st.x)); // -X
+        case 2: return normalize(vec3( st.x,  1.0,  st.y)); // +Y
+        case 3: return normalize(vec3( st.x, -1.0, -st.y)); // -Y
+        case 4: return normalize(vec3( st.x, -st.y,  1.0)); // +Z
+        case 5: return normalize(vec3(-st.x, -st.y, -1.0)); // -Z
+    }
+    return vec3(0.0);
+}
+
+vec3 proceduralSky(vec3 dir) {
+    // Simple gradient sky
+    float t = dir.y * 0.5 + 0.5; // [-1,1] -> [0,1]
+
+    // Ground (below horizon): dark ground color
+    vec3 groundColor = vec3(0.15, 0.12, 0.10);
+    // Horizon: warm white
+    vec3 horizonColor = vec3(0.8, 0.75, 0.7);
+    // Zenith: deep blue
+    vec3 zenithColor = vec3(0.2, 0.35, 0.8);
+
+    vec3 sky;
+    if (dir.y < 0.0) {
+        // Below horizon: blend ground to horizon
+        float s = clamp(-dir.y * 4.0, 0.0, 1.0);
+        sky = mix(horizonColor * 0.5, groundColor, s);
+    } else {
+        // Above horizon: blend horizon to zenith
+        float s = pow(t, 0.6);
+        sky = mix(horizonColor, zenithColor, clamp((t - 0.5) * 2.5, 0.0, 1.0));
+    }
+
+    // Sun disk
+    // Must match negated directional light direction from Engine.cpp
+    vec3 sunDir = normalize(vec3(-0.3, 1.0, -0.5));
+    float sunDot = dot(dir, sunDir);
+    if (sunDot > 0.999) {
+        sky += vec3(10.0, 9.0, 7.0); // Bright HDR sun
+    } else if (sunDot > 0.995) {
+        float glow = (sunDot - 0.995) / 0.004;
+        sky += vec3(5.0, 4.5, 3.5) * glow;
+    }
+
+    // Sun glow
+    float sunGlow = max(sunDot, 0.0);
+    sky += vec3(1.0, 0.7, 0.3) * pow(sunGlow, 32.0) * 0.5;
+    sky += vec3(1.0, 0.9, 0.7) * pow(sunGlow, 8.0) * 0.15;
+
+    return sky;
+}
+
+void main() {
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    int face = int(gl_GlobalInvocationID.z);
+    ivec2 size = imageSize(envMap).xy;
+
+    if (pos.x >= size.x || pos.y >= size.y || face >= 6) return;
+
+    vec2 uv = (vec2(pos) + 0.5) / vec2(size);
+    vec3 dir = cubeDir(face, uv);
+    vec3 color = proceduralSky(dir);
+
+    imageStore(envMap, ivec3(pos, face), vec4(color, 1.0));
+}

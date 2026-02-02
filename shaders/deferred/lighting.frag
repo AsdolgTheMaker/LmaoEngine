@@ -21,6 +21,7 @@ layout(set = 0, binding = 0) uniform GlobalUBO {
     vec4 resolution;
     mat4 cascadeViewProj[3];
     vec4 cascadeSplits; // xyz = split depths (view-space), w = shadow bias
+    float iblIntensity;
 };
 
 layout(set = 0, binding = 1) readonly buffer PointLightSSBO {
@@ -31,6 +32,9 @@ layout(set = 0, binding = 2) uniform sampler2D gAlbedoMetallic;
 layout(set = 0, binding = 3) uniform sampler2D gNormalRoughness;
 layout(set = 0, binding = 4) uniform sampler2D gDepth;
 layout(set = 0, binding = 5) uniform sampler2DArrayShadow shadowMap;
+layout(set = 0, binding = 6) uniform samplerCube irradianceMap;
+layout(set = 0, binding = 7) uniform samplerCube prefilteredMap;
+layout(set = 0, binding = 8) uniform sampler2D brdfLUT;
 
 layout(push_constant) uniform LightingPC {
     uint debugMode;
@@ -62,6 +66,11 @@ float geometrySmith(float NdotV, float NdotL, float roughness) {
 // Schlick Fresnel
 vec3 fresnelSchlick(float cosTheta, vec3 F0) {
     return F0 + (1.0 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+}
+
+// Schlick Fresnel with roughness (for IBL ambient)
+vec3 fresnelSchlickRoughness(float cosTheta, vec3 F0, float roughness) {
+    return F0 + (max(vec3(1.0 - roughness), F0) - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
 }
 
 // Reconstruct world position from depth
@@ -204,8 +213,25 @@ void main() {
         return;
     }
 
-    // Ambient
-    vec3 color = 0.03 * albedo;
+    // IBL ambient (split-sum approximation)
+    vec3 F0 = mix(vec3(0.04), albedo, metallic);
+    float NdotV = max(dot(N, V), 0.0);
+    vec3 F = fresnelSchlickRoughness(NdotV, F0, roughness);
+    vec3 kS = F;
+    vec3 kD = (1.0 - kS) * (1.0 - metallic);
+
+    // Diffuse IBL
+    vec3 irradiance = texture(irradianceMap, N).rgb;
+    vec3 diffuseIBL = kD * albedo * irradiance;
+
+    // Specular IBL
+    const float MAX_REFLECTION_LOD = 4.0;
+    vec3 R = reflect(-V, N);
+    vec3 prefilteredColor = textureLod(prefilteredMap, R, roughness * MAX_REFLECTION_LOD).rgb;
+    vec2 brdf = texture(brdfLUT, vec2(NdotV, roughness)).rg;
+    vec3 specularIBL = prefilteredColor * (F * brdf.x + brdf.y);
+
+    vec3 color = (diffuseIBL + specularIBL) * iblIntensity;
 
     // Shadow factor for directional light
     float shadow = (depth == 0.0) ? 1.0 : sampleShadowPCF(worldPos, viewZ);
