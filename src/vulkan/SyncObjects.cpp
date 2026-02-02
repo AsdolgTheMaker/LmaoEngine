@@ -1,5 +1,6 @@
 #include "vulkan/SyncObjects.h"
 #include "vulkan/VulkanUtils.h"
+#include "core/Log.h"
 
 namespace lmao {
 
@@ -21,6 +22,7 @@ bool FrameSync::init(VkDevice device, uint32_t frameCount) {
         VK_CHECK(vkCreateSemaphore(m_device, &sci, nullptr, &m_renderFinished[i]));
         VK_CHECK(vkCreateFence(m_device, &fci, nullptr, &m_inFlight[i]));
     }
+    LOG(Vulkan, Debug, "Frame sync created: %u frames", frameCount);
     return true;
 }
 

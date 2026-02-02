@@ -21,9 +21,9 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(
     void*)
 {
     if (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) {
-        LMAO_ERROR("Vulkan: %s", data->pMessage);
+        LOG(Vulkan, Error, "Validation: %s", data->pMessage);
     } else if (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) {
-        LMAO_WARN("Vulkan: %s", data->pMessage);
+        LOG(Vulkan, Warn, "Validation: %s", data->pMessage);
     }
     return VK_FALSE;
 }
@@ -36,7 +36,7 @@ bool VulkanContext::init(GLFWwindow* window) {
     // Initialize volk (loads vkGetInstanceProcAddr from the Vulkan loader)
     VkResult volkResult = volkInitialize();
     if (volkResult != VK_SUCCESS) {
-        LMAO_ERROR("Failed to initialize volk (Vulkan loader): %d", (int)volkResult);
+        LOG(Vulkan, Error, "Failed to initialize volk (Vulkan loader): %d", (int)volkResult);
         return false;
     }
 
@@ -55,9 +55,16 @@ bool VulkanContext::init(GLFWwindow* window) {
 
     if (!createAllocator()) return false;
 
-    LMAO_INFO("Vulkan context initialized");
-    LMAO_INFO("  Device: %s", m_deviceProps.deviceName);
-    LMAO_INFO("  Ray tracing: %s", m_features.rayTracing ? "supported" : "not available");
+    LOG(Vulkan, Info, "Vulkan context initialized");
+    LOG(Vulkan, Info, "  Device: %s", m_deviceProps.deviceName);
+    LOG(Vulkan, Info, "  API version: %u.%u.%u",
+        VK_VERSION_MAJOR(m_deviceProps.apiVersion),
+        VK_VERSION_MINOR(m_deviceProps.apiVersion),
+        VK_VERSION_PATCH(m_deviceProps.apiVersion));
+    LOG(Vulkan, Info, "  Ray tracing: %s", m_features.rayTracing ? "supported" : "not available");
+    LOG(Vulkan, Debug, "  Graphics queue family: %u", m_queueFamilies.graphics);
+    LOG(Vulkan, Debug, "  Present queue family: %u", m_queueFamilies.present);
+    LOG(Vulkan, Debug, "  Compute queue family: %u", m_queueFamilies.compute);
     return true;
 }
 
@@ -103,7 +110,7 @@ bool VulkanContext::createInstance() {
 
     VkResult r = vkCreateInstance(&createInfo, nullptr, &m_instance);
     if (r != VK_SUCCESS) {
-        LMAO_ERROR("Failed to create Vulkan instance: %d", (int)r);
+        LOG(Vulkan, Error, "Failed to create Vulkan instance: %d", (int)r);
         return false;
     }
     return true;
@@ -120,7 +127,7 @@ bool VulkanContext::setupDebugMessenger() {
 
     VkResult r = vkCreateDebugUtilsMessengerEXT(m_instance, &ci, nullptr, &m_debugMessenger);
     if (r != VK_SUCCESS) {
-        LMAO_WARN("Failed to set up debug messenger");
+        LOG(Vulkan, Warn, "Failed to set up debug messenger");
         return true; // non-fatal
     }
     return true;
@@ -129,7 +136,7 @@ bool VulkanContext::setupDebugMessenger() {
 bool VulkanContext::createSurface(GLFWwindow* window) {
     VkResult r = glfwCreateWindowSurface(m_instance, window, nullptr, &m_surface);
     if (r != VK_SUCCESS) {
-        LMAO_ERROR("Failed to create window surface");
+        LOG(Vulkan, Error, "Failed to create window surface");
         return false;
     }
     return true;
@@ -194,7 +201,7 @@ bool VulkanContext::pickPhysicalDevice() {
     uint32_t count = 0;
     vkEnumeratePhysicalDevices(m_instance, &count, nullptr);
     if (count == 0) {
-        LMAO_ERROR("No Vulkan-capable GPU found");
+        LOG(Vulkan, Error, "No Vulkan-capable GPU found");
         return false;
     }
 
@@ -211,7 +218,7 @@ bool VulkanContext::pickPhysicalDevice() {
     }
 
     if (bestScore < 0) {
-        LMAO_ERROR("No suitable GPU found");
+        LOG(Vulkan, Error, "No suitable GPU found");
         return false;
     }
 
@@ -293,7 +300,7 @@ bool VulkanContext::createLogicalDevice() {
 
     VkResult r = vkCreateDevice(m_physicalDevice, &createInfo, nullptr, &m_device);
     if (r != VK_SUCCESS) {
-        LMAO_ERROR("Failed to create logical device: %d", (int)r);
+        LOG(Vulkan, Error, "Failed to create logical device: %d", (int)r);
         return false;
     }
 
@@ -323,7 +330,7 @@ bool VulkanContext::createAllocator() {
 
     VkResult r = vmaCreateAllocator(&ci, &m_allocator);
     if (r != VK_SUCCESS) {
-        LMAO_ERROR("Failed to create VMA allocator: %d", (int)r);
+        LOG(Memory, Error, "Failed to create VMA allocator: %d", (int)r);
         return false;
     }
     return true;

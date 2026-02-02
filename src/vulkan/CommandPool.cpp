@@ -14,6 +14,7 @@ bool CommandPool::init(VkDevice device, uint32_t queueFamily, VkCommandPoolCreat
     ci.queueFamilyIndex = queueFamily;
 
     VK_CHECK(vkCreateCommandPool(m_device, &ci, nullptr, &m_pool));
+    LOG(Vulkan, Debug, "Command pool created: queueFamily=%u", queueFamily);
     return true;
 }
 

@@ -5,7 +5,7 @@ int main() {
     lmao::Engine engine;
 
     if (!engine.init()) {
-        LMAO_ERROR("Failed to initialize engine");
+        LOG(Core, Error, "Failed to initialize engine");
         return 1;
     }
 

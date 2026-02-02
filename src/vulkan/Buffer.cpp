@@ -45,7 +45,7 @@ bool Buffer::init(VmaAllocator allocator, VkDeviceSize size, VkBufferUsageFlags 
 
     VkResult r = vmaCreateBuffer(m_allocator, &bufInfo, &allocInfo, &m_buffer, &m_allocation, nullptr);
     if (r != VK_SUCCESS) {
-        LMAO_ERROR("Failed to create buffer: %d", (int)r);
+        LOG(Memory, Error, "Failed to create buffer (size=%llu): %d", (unsigned long long)size, (int)r);
         return false;
     }
 
@@ -56,6 +56,7 @@ bool Buffer::init(VmaAllocator allocator, VkDeviceSize size, VkBufferUsageFlags 
         vmaMapMemory(m_allocator, m_allocation, &m_mapped);
     }
 
+    LOG(Memory, Trace, "Buffer created: %llu bytes, usage=0x%x", (unsigned long long)size, usage);
     return true;
 }
 

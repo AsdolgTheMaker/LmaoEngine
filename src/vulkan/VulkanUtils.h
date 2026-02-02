@@ -6,7 +6,7 @@
     do {                                                                        \
         VkResult _r = (call);                                                   \
         if (_r != VK_SUCCESS) {                                                 \
-            LMAO_FATAL("Vulkan error %d at %s:%d", (int)_r, __FILE__, __LINE__);\
+            LOG(Vulkan, Fatal, "VkResult %d at %s:%d", (int)_r, __FILE__, __LINE__);\
         }                                                                       \
     } while (0)
 

@@ -104,7 +104,8 @@ bool Swapchain::init(VulkanContext& ctx, uint32_t width, uint32_t height) {
         VK_CHECK(vkCreateImageView(device, &vci, nullptr, &m_imageViews[i]));
     }
 
-    LMAO_INFO("Swapchain created: %ux%u, %u images", m_extent.width, m_extent.height, imageCount);
+    LOG(Swapchain, Info, "Swapchain created: %ux%u, %u images, format %d, present mode %d",
+        m_extent.width, m_extent.height, imageCount, (int)m_format, (int)presentMode);
     return true;
 }
 

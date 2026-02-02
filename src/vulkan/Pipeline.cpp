@@ -152,6 +152,8 @@ VkPipeline PipelineBuilder::build(VkDevice device) {
 
     VkPipeline pipeline;
     VK_CHECK(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &ci, nullptr, &pipeline));
+    LOG(Pipeline, Debug, "Graphics pipeline created: %u stages, %u color attachments",
+        (uint32_t)m_stages.size(), (uint32_t)m_colorFormats.size());
     return pipeline;
 }
 

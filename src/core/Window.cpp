@@ -10,7 +10,7 @@ Window::~Window() {
 
 bool Window::init(const WindowConfig& config) {
     if (!glfwInit()) {
-        LMAO_ERROR("Failed to initialize GLFW");
+        LOG(Core, Error, "Failed to initialize GLFW");
         return false;
     }
 
@@ -23,7 +23,7 @@ bool Window::init(const WindowConfig& config) {
         config.title, nullptr, nullptr
     );
     if (!m_window) {
-        LMAO_ERROR("Failed to create GLFW window");
+        LOG(Core, Error, "Failed to create GLFW window");
         glfwTerminate();
         return false;
     }
@@ -34,7 +34,7 @@ bool Window::init(const WindowConfig& config) {
     glfwSetWindowUserPointer(m_window, this);
     glfwSetFramebufferSizeCallback(m_window, framebufferResizeCallback);
 
-    LMAO_INFO("Window created: %ux%u", m_width, m_height);
+    LOG(Core, Info, "Window created: %ux%u", m_width, m_height);
     return true;
 }
 

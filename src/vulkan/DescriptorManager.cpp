@@ -25,6 +25,7 @@ bool DescriptorManager::init(VkDevice device, uint32_t maxSets) {
     ci.pPoolSizes = poolSizes.data();
 
     VK_CHECK(vkCreateDescriptorPool(m_device, &ci, nullptr, &m_pool));
+    LOG(Pipeline, Debug, "Descriptor pool created: maxSets=%u", maxSets);
     return true;
 }
 

@@ -24,6 +24,7 @@ bool Engine::init() {
 
     if (!m_vkCtx.init(m_window.handle())) return false;
     if (!m_swapchain.init(m_vkCtx, m_window.width(), m_window.height())) return false;
+    LOG(Core, Debug, "Swapchain image count: %u", m_swapchain.imageCount());
     if (!m_cmdPool.init(m_vkCtx.device(), m_vkCtx.queueFamilies().graphics)) return false;
     if (!m_frameSync.init(m_vkCtx.device(), m_swapchain.imageCount())) return false;
     if (!m_descriptors.init(m_vkCtx.device())) return false;
@@ -42,7 +43,7 @@ bool Engine::init() {
     if (!initTriangleDemo()) return false;
 
     m_timer.reset();
-    LMAO_INFO("Engine initialized");
+    LOG(Core, Info, "Engine initialized");
     return true;
 }
 
@@ -322,6 +323,7 @@ void Engine::drawFrame() {
 
 void Engine::handleResize() {
     m_resizeNeeded = false;
+    LOG(Swapchain, Info, "Resize triggered: %ux%u", m_window.width(), m_window.height());
     m_vkCtx.waitIdle();
 
     m_depthImage.shutdown();
@@ -358,6 +360,7 @@ void Engine::run() {
 void Engine::shutdown() {
     VkDevice device = m_vkCtx.device();
     if (!device) return;
+    LOG(Core, Info, "Engine shutting down");
 
     m_vkCtx.waitIdle();
 

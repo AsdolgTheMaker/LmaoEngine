@@ -74,6 +74,7 @@ bool Image::init(VmaAllocator allocator, VkDevice device, const CreateInfo& info
 
     VK_CHECK(vkCreateImageView(m_device, &viewInfo, nullptr, &m_view));
 
+    LOG(Memory, Trace, "Image created: %ux%u, format=%d, mips=%u", info.width, info.height, (int)info.format, info.mipLevels);
     return true;
 }
 

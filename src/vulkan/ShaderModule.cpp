@@ -27,7 +27,7 @@ bool ShaderModule::loadFromFile(VkDevice device, const std::string& path) {
 
     std::ifstream file(path, std::ios::ate | std::ios::binary);
     if (!file.is_open()) {
-        LMAO_ERROR("Failed to open shader file: %s", path.c_str());
+        LOG(Pipeline, Error, "Failed to open shader file: %s", path.c_str());
         return false;
     }
 
@@ -41,6 +41,7 @@ bool ShaderModule::loadFromFile(VkDevice device, const std::string& path) {
     ci.pCode = code.data();
 
     VK_CHECK(vkCreateShaderModule(m_device, &ci, nullptr, &m_module));
+    LOG(Pipeline, Debug, "Shader loaded: %s (%zu bytes)", path.c_str(), size);
     return true;
 }
 
